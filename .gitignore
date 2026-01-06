@@ -1,0 +1,7 @@
+build/
+install/
+log/
+.vscode/
+
+src/sam3_pkg/sam3_pkg/weight/
+src/qwen_pkg/images/
