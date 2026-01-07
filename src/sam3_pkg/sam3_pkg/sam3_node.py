@@ -18,9 +18,9 @@ from .sam3 import build_sam3_image_model
 from .sam3.model.sam3_image_processor import Sam3Processor
 
 
-class ImageShow(Node):
+class SAM3_Process(Node):
     def __init__(self):
-        super().__init__('image_show')
+        super().__init__('sam3_process')
         self.bridge = CvBridge() if CvBridge else None
 
         # Parameters for topics and prompt
@@ -527,7 +527,7 @@ class ImageShow(Node):
 
 def main():
     rclpy.init()
-    node = ImageShow()
+    node = SAM3_Process()
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     try:
