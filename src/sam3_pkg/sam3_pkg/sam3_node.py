@@ -124,6 +124,159 @@ class ImageShow(Node):
             return depth_array.astype(np.float32) * 0.001
         return depth_array.astype(np.float32)
 
+    def _median_depth_in_circle(self, depth_m: np.ndarray, u: int, v: int, radius_px: int = 6):
+        if depth_m is None:
+            return None
+        h, w = depth_m.shape[:2]
+        if not (0 <= u < w and 0 <= v < h):
+            return None
+
+        x0 = max(0, u - radius_px)
+        x1 = min(w - 1, u + radius_px)
+        y0 = max(0, v - radius_px)
+        y1 = min(h - 1, v + radius_px)
+
+        yy, xx = np.ogrid[y0:y1 + 1, x0:x1 + 1]
+        circle = (xx - u) ** 2 + (yy - v) ** 2 <= radius_px ** 2
+        patch = depth_m[y0:y1 + 1, x0:x1 + 1]
+        vals = patch[circle]
+        vals = vals[np.isfinite(vals) & (vals > 0)]
+        if vals.size == 0:
+            return None
+        return float(np.median(vals))
+
+    def _segment_intersection(self, a, b):
+        """Return intersection point (x,y) of two infinite lines through segments a,b.
+        a/b: (x1,y1,x2,y2). Returns None if nearly parallel.
+        """
+        x1, y1, x2, y2 = map(float, a)
+        x3, y3, x4, y4 = map(float, b)
+        den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(den) < 1e-6:
+            return None
+        px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / den
+        py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / den
+        return float(px), float(py)
+
+
+    def _draw_infinite_line_on_crop(self, frame_bgr: np.ndarray, seg, res: int, color, thickness: int = 2):
+        """Draw an infinite line (defined by a segment) across the crop image boundaries."""
+        x1, y1, x2, y2 = map(float, seg[:4])
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+
+        points = []
+        # intersect with x=0 and x=res-1
+        if abs(dx) > 1e-6:
+            for x in (0.0, float(res - 1)):
+                t = (x - x1) / dx
+                y = y1 + t * dy
+                if 0.0 <= y <= float(res - 1):
+                    points.append((int(round(x)), int(round(y))))
+        # intersect with y=0 and y=res-1
+        if abs(dy) > 1e-6:
+            for y in (0.0, float(res - 1)):
+                t = (y - y1) / dy
+                x = x1 + t * dx
+                if 0.0 <= x <= float(res - 1):
+                    points.append((int(round(x)), int(round(y))))
+
+        uniq = []
+        for p in points:
+            if p not in uniq:
+                uniq.append(p)
+        if len(uniq) < 2:
+            return
+
+        best = None
+        best_d = -1.0
+        for i in range(len(uniq)):
+            for j in range(i + 1, len(uniq)):
+                d = (uniq[i][0] - uniq[j][0]) ** 2 + (uniq[i][1] - uniq[j][1]) ** 2
+                if d > best_d:
+                    best_d = d
+                    best = (uniq[i], uniq[j])
+        if best is None:
+            return
+
+        cv2.line(frame_bgr, best[0], best[1], color, thickness)
+
+    def _wrap_angle_pi(self, ang: float) -> float:
+        """Normalize angle to [0, pi)."""
+        ang = float(ang) % np.pi
+        return ang
+
+    def _fit_line_from_mask_points(self, mask_u8: np.ndarray, min_points: int = 200):
+        """Fit a line from all mask points using PCA, then refine with inlier selection.
+
+        Returns dict or None:
+          {
+            'point': (x0,y0),         # point on line (centroid)
+            'dir': (dx,dy),           # unit direction
+            'angle': angle_in_[0,pi),
+            'length': approx_extent,  # projected mask extent along the line
+            'seg': (x1,y1,x2,y2)       # representative segment endpoints (for intersection math)
+          }
+        """
+        ys, xs = np.where(mask_u8 > 0)
+        if xs.size < min_points:
+            return None
+
+        pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+        c = pts.mean(axis=0)
+        X = pts - c
+        # PCA: principal direction
+        cov = (X.T @ X) / max(1.0, float(X.shape[0]))
+        w, v = np.linalg.eigh(cov)
+        d = v[:, int(np.argmax(w))]
+        dx, dy = float(d[0]), float(d[1])
+        nrm = float(np.hypot(dx, dy))
+        if nrm < 1e-6:
+            return None
+        dx /= nrm
+        dy /= nrm
+
+        # refine: keep inliers near the line
+        # distance = |(p-c) x d|
+        dist = np.abs(X[:, 0] * dy - X[:, 1] * dx)
+        thr = max(2.0, float(np.percentile(dist, 50)) * 1.5)
+        inliers = pts[dist <= thr]
+        if inliers.shape[0] >= min_points // 2:
+            c = inliers.mean(axis=0)
+            X2 = inliers - c
+            cov2 = (X2.T @ X2) / max(1.0, float(X2.shape[0]))
+            w2, v2 = np.linalg.eigh(cov2)
+            d2 = v2[:, int(np.argmax(w2))]
+            dx, dy = float(d2[0]), float(d2[1])
+            nrm2 = float(np.hypot(dx, dy))
+            if nrm2 >= 1e-6:
+                dx /= nrm2
+                dy /= nrm2
+                pts = inliers
+
+        # compute extent along direction
+        proj = (pts[:, 0] - c[0]) * dx + (pts[:, 1] - c[1]) * dy
+        tmin = float(np.min(proj))
+        tmax = float(np.max(proj))
+        length = float(tmax - tmin)
+
+        x1 = float(c[0] + tmin * dx)
+        y1 = float(c[1] + tmin * dy)
+        x2 = float(c[0] + tmax * dx)
+        y2 = float(c[1] + tmax * dy)
+
+        ang = self._wrap_angle_pi(np.arctan2(dy, dx))
+
+        return {
+            'point': (float(c[0]), float(c[1])),
+            'dir': (dx, dy),
+            'angle': float(ang),
+            'length': float(length),
+            'seg': (x1, y1, x2, y2),
+        }
+
     def try_process_and_show(self):
 
         if self.last_type == '':
@@ -159,7 +312,140 @@ class ImageShow(Node):
 
         display_frame = cv2.cvtColor(image_cropped, cv2.COLOR_RGB2BGR)
 
-        if self.last_type == '2':
+        if self.last_type == '0':  # points (solid point) -> sample depth INSIDE mask
+            if masks is not None and masks.shape[0] > 0 and depth_m is not None and self.cam_K is not None:
+                for i in range(masks.shape[0]):
+                    mask = (masks[i, 0].astype(np.uint8) * 255)
+
+                    # visualize mask (red)
+                    color = (0, 0, 255)
+                    colored_mask = np.zeros_like(display_frame, dtype=np.uint8)
+                    colored_mask[:, :, 0] = mask * (color[0] / 255)
+                    colored_mask[:, :, 1] = mask * (color[1] / 255)
+                    colored_mask[:, :, 2] = mask * (color[2] / 255)
+                    display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.35, 0)
+
+                    M = cv2.moments(mask)
+                    if M["m00"] == 0:
+                        continue
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+
+                    # inside-mask depth (map crop coords -> full coords)
+                    inside_y, inside_x = np.where(mask > 0)
+                    inside_y_full = inside_y + start_y
+                    inside_x_full = inside_x + start_x
+
+                    valid_depths = []
+                    for rx, ry in zip(inside_x_full, inside_y_full):
+                        if 0 <= ry < depth_m.shape[0] and 0 <= rx < depth_m.shape[1]:
+                            d = float(depth_m[ry, rx])
+                            if d > 0 and np.isfinite(d):
+                                valid_depths.append(d)
+
+                    label = f'({cX},{cY})'
+                    if valid_depths:
+                        Z = float(np.median(valid_depths))
+                        u_full = cX + start_x
+                        v_full = cY + start_y
+                        X = (u_full - cx) / fx * Z
+                        Y = (v_full - cy) / fy * Z
+                        label = f'X:{X:.2f} Y:{Y:.2f} Z:{Z:.2f}m'
+                    else:
+                        label += ' No Depth'
+
+                    cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
+                    cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        elif self.last_type == '1':  # lines
+            if masks is not None and masks.shape[0] > 0 and depth_m is not None and self.cam_K is not None:
+                # (A) show ALL masks with a light overlay
+                for i in range(masks.shape[0]):
+                    m = (masks[i, 0].astype(np.uint8) * 255)
+                    colored = np.zeros_like(display_frame, dtype=np.uint8)
+                    colored[:, :, 0] = m
+                    colored[:, :, 1] = (m * 0.6).astype(np.uint8)
+                    colored[:, :, 2] = (m * 0.2).astype(np.uint8)
+                    display_frame = cv2.addWeighted(display_frame, 1.0, colored, 0.18, 0)
+
+                # (B) fit ONE line per mask using all mask points (PCA)
+                fitted = []
+                for i in range(masks.shape[0]):
+                    mask_u8 = (masks[i, 0].astype(np.uint8) * 255)
+                    line = self._fit_line_from_mask_points(mask_u8)
+                    if line is None:
+                        continue
+                    fitted.append(line)
+
+                if len(fitted) >= 2:
+                    # (C) group by orientation and keep the longest line in each direction
+                    bins = []  # each: [rep_angle, best_line]
+                    ang_thresh = np.deg2rad(15.0)
+                    for ln in sorted(fitted, key=lambda x: -x['length']):
+                        placed = False
+                        for b in bins:
+                            rep = b[0]
+                            d = abs(ln['angle'] - rep)
+                            d = min(d, np.pi - d)
+                            if d < ang_thresh:
+                                placed = True
+                                if ln['length'] > b[1]['length']:
+                                    b[0] = ln['angle']
+                                    b[1] = ln
+                                break
+                        if not placed:
+                            bins.append([ln['angle'], ln])
+                    candidates = [b[1] for b in bins]
+
+                    if len(candidates) >= 2:
+                        candidates.sort(key=lambda x: -x['length'])
+
+                        # (D) choose the best non-parallel pair (prefer longer)
+                        best_pair = None
+                        best_score = -1.0
+                        for i in range(len(candidates)):
+                            for j in range(i + 1, len(candidates)):
+                                a = candidates[i]
+                                b = candidates[j]
+                                dang = abs(a['angle'] - b['angle'])
+                                dang = min(dang, np.pi - dang)
+                                if dang < np.deg2rad(20.0):
+                                    continue
+                                score = a['length'] + b['length']
+                                if score > best_score:
+                                    best_score = score
+                                    best_pair = (a, b)
+                        if best_pair is not None:
+                            a, b = best_pair
+
+                            # (E) intersection of the two fitted lines (use their representative seg)
+                            inter = self._segment_intersection(a['seg'], b['seg'])
+                            if inter is not None:
+                                ix, iy = inter
+                                ix_i = int(np.clip(round(ix), 0, res - 1))
+                                iy_i = int(np.clip(round(iy), 0, res - 1))
+
+                                u_full = ix_i + start_x
+                                v_full = iy_i + start_y
+                                Z = self._median_depth_in_circle(depth_m, u_full, v_full, radius_px=8)
+
+                                label = f'({ix_i},{iy_i})'
+                                if Z is not None:
+                                    X = (u_full - cx) / fx * Z
+                                    Y = (v_full - cy) / fy * Z
+                                    label = f'X:{X:.2f} Y:{Y:.2f} Z:{Z:.2f}m'
+                                else:
+                                    label += ' No Depth'
+
+                                # (F) draw infinite lines
+                                self._draw_infinite_line_on_crop(display_frame, a['seg'], res, (0, 255, 255), thickness=2)
+                                self._draw_infinite_line_on_crop(display_frame, b['seg'], res, (255, 255, 0), thickness=2)
+
+                                cv2.circle(display_frame, (ix_i, iy_i), 6, (0, 0, 255), -1)
+                                cv2.putText(display_frame, label, (ix_i + 10, iy_i), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                            (0, 255, 255), 2)
+
+        elif self.last_type == '2':  # holes
             if masks is not None and masks.shape[0] > 0:
                 for i in range(masks.shape[0]):
                     mask = masks[i, 0] # [resolution, resolution]
@@ -228,6 +514,8 @@ class ImageShow(Node):
 
                         cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
                         cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        
 
         # Overlay fps and description
         cv2.putText(display_frame, f'FPS: {fps:.2f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
