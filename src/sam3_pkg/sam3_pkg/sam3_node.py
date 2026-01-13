@@ -337,6 +337,20 @@ class SAM3_Process(Node):
             'seg': (x1, y1, x2, y2),
         }
 
+    def _draw_mask_index(self, display_frame: np.ndarray, mask_u8: np.ndarray, idx: int, color=(255, 255, 255)):
+        """Draw mask index near its centroid."""
+        if display_frame is None or mask_u8 is None:
+            return
+        M = cv2.moments(mask_u8)
+        if M.get('m00', 0) == 0:
+            return
+        cX = int(M['m10'] / M['m00'])
+        cY = int(M['m01'] / M['m00'])
+        text = str(idx)
+        # outline for readability
+        cv2.putText(display_frame, text, (cX, cY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
+        cv2.putText(display_frame, text, (cX, cY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
     def try_process_and_publish(self):
 
         if self.last_color is None or self.last_color_msg is None:
@@ -393,6 +407,9 @@ class SAM3_Process(Node):
                     colored_mask[:, :, 2] = mask * (color[2] / 255)
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.35, 0)
 
+                    # draw mask index (mask order)
+                    self._draw_mask_index(display_frame, mask, i)
+
                     M = cv2.moments(mask)
                     if M["m00"] == 0:
                         continue
@@ -435,6 +452,9 @@ class SAM3_Process(Node):
                     colored[:, :, 1] = (m * 0.6).astype(np.uint8)
                     colored[:, :, 2] = (m * 0.2).astype(np.uint8)
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored, 0.18, 0)
+
+                    # draw mask index
+                    self._draw_mask_index(display_frame, m, i)
 
                 # (B) fit ONE line per mask using all mask points (PCA)
                 fitted = []
@@ -516,19 +536,20 @@ class SAM3_Process(Node):
         elif self.last_type == '2':  # holes
             if masks is not None and masks.shape[0] > 0:
                 for i in range(masks.shape[0]):
-                    mask = masks[i, 0] # [resolution, resolution]
+                    mask = masks[i, 0]  # [resolution, resolution]
 
                     mask = mask.astype(np.uint8) * 255
-                    color = (255, 0, 0)  # 固定颜色为蓝色
-
+                    color = (255, 0, 0)
 
                     colored_mask = np.zeros_like(display_frame, dtype=np.uint8)
                     colored_mask[:, :, 0] = mask * (color[0] / 255)
                     colored_mask[:, :, 1] = mask * (color[1] / 255)
                     colored_mask[:, :, 2] = mask * (color[2] / 255)
 
-                    # 半透明叠加
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.5, 0)
+
+                    # draw mask index
+                    self._draw_mask_index(display_frame, mask, i)
 
                     # 计算并绘制中心点
                     M = cv2.moments(mask)
@@ -570,7 +591,8 @@ class SAM3_Process(Node):
                             label += ' No Depth'
 
                         cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
-                        cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        # X-Y-Z
+                        # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # Overlay fps and description
         cv2.putText(display_frame, f'FPS: {fps:.2f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
