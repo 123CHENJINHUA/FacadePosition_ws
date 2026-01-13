@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 
-from sam3_pkg.memory_bank import MemoryBank
+from memory_bank import MemoryBank
 
 
 def main() -> None:

@@ -71,9 +71,9 @@ def generate_launch_description():
     ld.add_action(declare_enable_realsense)
     ld.add_action(declare_depth_topic)
     ld.add_action(declare_color_topic)
-    ld.add_action(realsense_launch)
+    # ld.add_action(realsense_launch)
     ld.add_action(qwen_node)
-    # ld.add_action(img_show_node)
+    ld.add_action(img_show_node)
     ld.add_action(sam3_node)
 
     return ld

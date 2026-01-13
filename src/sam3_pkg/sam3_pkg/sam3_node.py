@@ -9,13 +9,15 @@ from PIL import Image as PILImage
 import time
 from pathlib import Path
 
-
 from cv_bridge import CvBridge
 import cv2
 
 import torch
 from .sam3 import build_sam3_image_model
 from .sam3.model.sam3_image_processor import Sam3Processor
+
+import threading
+import queue
 
 
 class SAM3_Process(Node):
@@ -31,7 +33,6 @@ class SAM3_Process(Node):
         self.color_topic = self.get_parameter('color_topic').get_parameter_value().string_value
         self.depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         self.camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
-        
 
         # Subscribers
         self.sub_image = self.create_subscription(Image, self.color_topic, self.on_color, 10)
@@ -39,7 +40,17 @@ class SAM3_Process(Node):
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_camera_info, 10)
         self.sub_qwen = self.create_subscription(QwenResponse, 'qwen_service/response', self.on_qwen, 10)
 
+        # Publisher (publish processed overlay image)
+        self.pub_result = self.create_publisher(Image, 'camera/sam3_result', 10)
+
+        # Publishing thread state (drop old frames to avoid backlog)
+        self._pub_queue: "queue.Queue[tuple[np.ndarray, Image] | None]" = queue.Queue(maxsize=1)
+        self._pub_stop = threading.Event()
+        self._pub_thread = threading.Thread(target=self._publish_worker, daemon=True)
+        self._pub_thread.start()
+
         # State
+        self.last_color_msg = None
         self.last_color = None
         self.last_depth = None
         self.depth_encoding = None
@@ -53,8 +64,6 @@ class SAM3_Process(Node):
         self.last_type = ''
         self.last_reason = ''
         self.target_resolution = 480
-
-        cv2.namedWindow('camera', cv2.WINDOW_NORMAL)
 
         pkg_name = 'sam3_pkg'
         self.bpe_path = None
@@ -72,6 +81,56 @@ class SAM3_Process(Node):
 
         self._init_sam3_if_needed()
 
+    def destroy_node(self):
+        # stop publisher thread before shutting down
+        try:
+            self._pub_stop.set()
+            try:
+                self._pub_queue.put_nowait(None)
+            except Exception:
+                pass
+            if getattr(self, '_pub_thread', None) is not None:
+                self._pub_thread.join(timeout=1.0)
+        finally:
+            return super().destroy_node()
+
+    def _enqueue_publish(self, frame_bgr: np.ndarray, color_msg: Image):
+        if frame_bgr is None or color_msg is None:
+            return
+        # keep only latest
+        try:
+            if self._pub_queue.full():
+                try:
+                    _ = self._pub_queue.get_nowait()
+                except Exception:
+                    pass
+            self._pub_queue.put_nowait((frame_bgr, color_msg))
+        except Exception:
+            pass
+
+    def _publish_worker(self):
+        # publish images from background thread
+        while not self._pub_stop.is_set():
+            item = None
+            try:
+                item = self._pub_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            if item is None:
+                continue
+            frame_bgr, color_msg = item
+            try:
+                if self.bridge is None:
+                    continue
+                out_msg = self.bridge.cv2_to_imgmsg(frame_bgr, encoding='bgr8')
+                out_msg.header = color_msg.header
+                self.pub_result.publish(out_msg)
+            except Exception as e:
+                try:
+                    self.get_logger().warn(f'publish sam3_result failed: {e}')
+                except Exception:
+                    pass
+
     def on_qwen(self, msg: QwenResponse):
         self.last_description = (msg.description or '').strip()
         self.last_type = (msg.type or '').strip()
@@ -88,8 +147,9 @@ class SAM3_Process(Node):
     def on_color(self, msg: Image):
         if self.bridge is None:
             return
+        self.last_color_msg = msg
         self.last_color = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        self.try_process_and_show()
+        self.try_process_and_publish()
 
     def on_depth(self, msg: Image):
         if self.bridge is None:
@@ -277,11 +337,14 @@ class SAM3_Process(Node):
             'seg': (x1, y1, x2, y2),
         }
 
-    def try_process_and_show(self):
+    def try_process_and_publish(self):
 
+        if self.last_color is None or self.last_color_msg is None:
+            return
+
+        # If prompt/type not ready, just publish raw color
         if self.last_type == '':
-            cv2.imshow('camera', self.last_color)
-            cv2.waitKey(1)
+            self._enqueue_publish(self.last_color, self.last_color_msg)
             return
 
         frame_bgr = self.last_color.copy()
@@ -308,7 +371,12 @@ class SAM3_Process(Node):
         fps = 1.0 / max(1e-6, (time.time() - t0))
 
         depth_m = self._depth_to_meters(self.last_depth)
-        fx, fy, cx, cy, W, H = self.cam_K
+        if self.cam_K is None:
+            # publish cropped overlay without 3D projection
+            fx = fy = cx = cy = 0.0
+            W = H = 0
+        else:
+            fx, fy, cx, cy, W, H = self.cam_K
 
         display_frame = cv2.cvtColor(image_cropped, cv2.COLOR_RGB2BGR)
 
@@ -449,46 +517,37 @@ class SAM3_Process(Node):
             if masks is not None and masks.shape[0] > 0:
                 for i in range(masks.shape[0]):
                     mask = masks[i, 0] # [resolution, resolution]
-                    
+
                     mask = mask.astype(np.uint8) * 255
                     color = (255, 0, 0)  # 固定颜色为蓝色
-                    
+
+
                     colored_mask = np.zeros_like(display_frame, dtype=np.uint8)
                     colored_mask[:, :, 0] = mask * (color[0] / 255)
                     colored_mask[:, :, 1] = mask * (color[1] / 255)
                     colored_mask[:, :, 2] = mask * (color[2] / 255)
-                    
+
                     # 半透明叠加
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.5, 0)
 
-
                     # 计算并绘制中心点
                     M = cv2.moments(mask)
-                    if M["m00"] != 0:
+                    if M["m00"] != 0 and depth_m is not None and self.cam_K is not None:
                         cX = int(M["m10"] / M["m00"])
                         cY = int(M["m01"] / M["m00"])
-                        
-                        # --- 计算3D坐标 (针对孔洞优化) ---
-                        # 策略：孔洞本身没有深度（或深度无效），我们需要采样孔洞边缘（Rim）的深度
-                        
-                        # 1. 膨胀掩码以获取边缘区域
+
                         kernel = np.ones((5, 5), np.uint8)
                         dilated_mask = cv2.dilate(mask, kernel, iterations=3)
-                        # 2. 减去原始掩码得到环状边缘 (Rim)
                         rim_mask = cv2.subtract(dilated_mask, mask)
-                        
-                        # 可视化膨胀区域 (Rim) - 绿色半透明
-                        rim_color = (0, 255, 0) 
+
+                        rim_color = (0, 255, 0)
                         colored_rim = np.zeros_like(display_frame, dtype=np.uint8)
                         colored_rim[:, :, 0] = rim_mask * (rim_color[0] / 255)
                         colored_rim[:, :, 1] = rim_mask * (rim_color[1] / 255)
                         colored_rim[:, :, 2] = rim_mask * (rim_color[2] / 255)
                         display_frame = cv2.addWeighted(display_frame, 1.0, colored_rim, 0.5, 0)
 
-                        # 3. 获取边缘像素的坐标
                         rim_y, rim_x = np.where(rim_mask > 0)
-                        
-                        # 4. 映射回原始全图坐标
                         rim_y_full = rim_y + start_y
                         rim_x_full = rim_x + start_x
 
@@ -496,8 +555,8 @@ class SAM3_Process(Node):
                         for rx, ry in zip(rim_x_full, rim_y_full):
                             if 0 <= ry < depth_m.shape[0] and 0 <= rx < depth_m.shape[1]:
                                 d = depth_m[ry, rx]
-                                if d > 0:
-                                    valid_depths.append(d)
+                                if d > 0 and np.isfinite(d):
+                                    valid_depths.append(float(d))
 
                         label = f'({cX},{cY})'
                         if valid_depths:
@@ -507,22 +566,17 @@ class SAM3_Process(Node):
                             X = (u_full - cx) / fx * Z
                             Y = (v_full - cy) / fy * Z
                             label = f'X:{X:.2f} Y:{Y:.2f} Z:{Z:.2f}m'
-                            # Log coordinates
-                            # self.get_logger().info(f'Mask {i}: {label}')
                         else:
                             label += ' No Depth'
 
                         cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
                         cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        
-
         # Overlay fps and description
         cv2.putText(display_frame, f'FPS: {fps:.2f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        cv2.imshow('camera', display_frame)
-        cv2.waitKey(1)
+        self._enqueue_publish(display_frame, self.last_color_msg)
 
 
 def main():
@@ -536,8 +590,6 @@ def main():
         pass
     finally:
         node.destroy_node()
-        if cv2 is not None:
-            cv2.destroyAllWindows()
         rclpy.shutdown()
 
 if __name__ == '__main__':
