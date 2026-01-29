@@ -4,6 +4,8 @@ from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import Image, CameraInfo
 from qwen_pkg_interfaces.msg import QwenResponse
 
+from geometry_msgs.msg import TransformStamped
+
 import numpy as np
 from PIL import Image as PILImage
 import time
@@ -16,8 +18,12 @@ import torch
 from .sam3 import build_sam3_image_model
 from .sam3.model.sam3_image_processor import Sam3Processor
 
+from .memory_bank import MemoryBank
+
 import threading
 import queue
+
+import yaml
 
 
 class SAM3_Process(Node):
@@ -29,16 +35,21 @@ class SAM3_Process(Node):
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
+        self.declare_parameter('tcp_pose_topic', '/robot1/tcp_pose')
 
         self.color_topic = self.get_parameter('color_topic').get_parameter_value().string_value
         self.depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         self.camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
+        self.tcp_pose_topic = self.get_parameter('tcp_pose_topic').get_parameter_value().string_value
+
 
         # Subscribers
         self.sub_image = self.create_subscription(Image, self.color_topic, self.on_color, 10)
         self.sub_depth = self.create_subscription(Image, self.depth_topic, self.on_depth, 10)
         self.sub_info = self.create_subscription(CameraInfo, self.camera_info_topic, self.on_camera_info, 10)
         self.sub_qwen = self.create_subscription(QwenResponse, 'qwen_service/response', self.on_qwen, 10)
+        # TCP pose now published as TransformStamped (translation + quaternion)
+        self.sub_tcp_pose = self.create_subscription(TransformStamped, self.tcp_pose_topic, self.on_tcp_pose, 10)
 
         # Publisher (publish processed overlay image)
         self.pub_result = self.create_publisher(Image, 'camera/sam3_result', 10)
@@ -56,6 +67,17 @@ class SAM3_Process(Node):
         self.depth_encoding = None
         self.cam_K = None  # fx, fy, cx, cy
 
+        # camera pose (world): (x,y,z,roll,pitch,yaw)
+        self.last_pose_cam2world = None
+
+        # MemoryBank for stable IDs
+        self.bank = MemoryBank(match_threshold=0.01, max_missed_frames=30000)
+        self.bank_init = False
+        self.total_3dpoints = []
+        self.total_2dpoints = []
+        self.odometry = None
+        self.offset2edge = 0
+
         # SAM3 model lazily initialized on first frame
         self.model = None
         self.processor = None
@@ -68,6 +90,8 @@ class SAM3_Process(Node):
         pkg_name = 'sam3_pkg'
         self.bpe_path = None
         self.checkpoint_path = None
+        self.hand_eye_path = None
+     
 
         file_path = Path(__file__).resolve()
         for p in file_path.parents:
@@ -75,11 +99,22 @@ class SAM3_Process(Node):
                 ws_root = p.parent
                 bpe_path = ws_root / 'src' / pkg_name / pkg_name / 'weight' / 'bpe_simple_vocab_16e6.txt.gz'
                 checkpoint_path = ws_root / 'src' / pkg_name / pkg_name / 'weight' / 'sam3.pt'
+                hand_eye_path = ws_root / 'src' / pkg_name / pkg_name / 'weight' / 'hand_eye.yaml'
                 break
         self.bpe_path = str(bpe_path)
         self.checkpoint_path = str(checkpoint_path)
+        self.hand_eye_path = str(hand_eye_path)
+
+        # Hand-eye transform (TCP->Camera). Translation unit: meters.
+        self.T_tcp_cam = self._load_hand_eye_4x4(self.hand_eye_path)
+        if self.T_tcp_cam is None:
+            raise RuntimeError(f'Failed to load hand-eye matrix from: {self.hand_eye_path}')
+
 
         self._init_sam3_if_needed()
+
+        # Time reference (first received color frame = 0s)
+        self._t0_first_color_frame: float | None = None
 
     def destroy_node(self):
         # stop publisher thread before shutting down
@@ -147,6 +182,10 @@ class SAM3_Process(Node):
     def on_color(self, msg: Image):
         if self.bridge is None:
             return
+        # Start time at the first received frame, regardless of processing.
+        if self._t0_first_color_frame is None:
+            self._t0_first_color_frame = time.time()
+
         self.last_color_msg = msg
         self.last_color = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         self.try_process_and_publish()
@@ -158,6 +197,149 @@ class SAM3_Process(Node):
         self.depth_encoding = msg.encoding
         depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         self.last_depth = depth
+
+    def _load_hand_eye_4x4(self, path: str):
+        """Load 4x4 hand-eye matrix from YAML (meters).
+
+        Expected format:
+          T_tcp_cam:
+            - [r11,r12,r13,tx]
+            - [r21,r22,r23,ty]
+            - [r31,r32,r33,tz]
+            - [0,0,0,1]
+        """
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+
+            data = yaml.safe_load(p.read_text(encoding='utf-8'))
+            if not isinstance(data, dict) or 'T_tcp_cam' not in data:
+                return None
+
+            T = np.array(data['T_tcp_cam'], dtype=np.float64)
+            if T.shape != (4, 4):
+                return None
+
+            # normalize last row
+            T[3, :] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+            return T
+        except Exception as e:
+            try:
+                self.get_logger().warn(f'load hand-eye failed: {e}')
+            except Exception:
+                pass
+            return None
+
+    def on_tcp_pose(self, msg: TransformStamped):
+        # Expected TransformStamped with translation (m) and rotation quaternion (x,y,z,w)
+        try:
+            t = msg.transform.translation
+            q = msg.transform.rotation
+
+            tx = float(t.x)
+            ty = float(t.y)
+            tz = float(t.z)
+
+            qx = float(q.x)
+            qy = float(q.y)
+            qz = float(q.z)
+            qw = float(q.w)
+
+            # build rotation matrix from quaternion
+            # Reference: https://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
+            xx = qx * qx
+            yy = qy * qy
+            zz = qz * qz
+            xy = qx * qy
+            xz = qx * qz
+            yz = qy * qz
+            wx = qw * qx
+            wy = qw * qy
+            wz = qw * qz
+
+            R = np.array([
+                [1.0 - 2.0 * (yy + zz),       2.0 * (xy - wz),           2.0 * (xz + wy)],
+                [      2.0 * (xy + wz),   1.0 - 2.0 * (xx + zz),         2.0 * (yz - wx)],
+                [      2.0 * (xz - wy),         2.0 * (yz + wx),     1.0 - 2.0 * (xx + yy)],
+            ], dtype=np.float64)
+
+            T_base_tcp = np.eye(4, dtype=np.float64)
+            T_base_tcp[0:3, 0:3] = R
+            T_base_tcp[0:3, 3] = np.array([tx, ty, tz], dtype=np.float64)
+
+            # Always apply hand-eye: base->cam = (base->tcp) @ (tcp->cam)
+            T_base_cam = T_base_tcp @ self.T_tcp_cam
+            self.last_pose_cam2world = self._T_to_pose6(T_base_cam)
+        except Exception:
+            return
+        
+    def _rpy_to_R(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
+        """Convert roll/pitch/yaw (radians, ZYX) to rotation matrix."""
+        cr = float(np.cos(roll)); sr = float(np.sin(roll))
+        cp = float(np.cos(pitch)); sp = float(np.sin(pitch))
+        cy = float(np.cos(yaw)); sy = float(np.sin(yaw))
+
+        Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+        return (Rz @ Ry @ Rx)
+
+    def _R_to_rpy(self, R: np.ndarray):
+        """Convert rotation matrix to roll/pitch/yaw (radians, ZYX)."""
+        r20 = float(R[2, 0])
+        r21 = float(R[2, 1])
+        r22 = float(R[2, 2])
+        r10 = float(R[1, 0])
+        r00 = float(R[0, 0])
+
+        pitch = float(np.arctan2(-r20, np.sqrt(r21 * r21 + r22 * r22)))
+        yaw = float(np.arctan2(r10, r00))
+        roll = float(np.arctan2(r21, r22))
+        return roll, pitch, yaw
+
+    def _pose6_to_T(self, pose6) -> np.ndarray:
+        """(x,y,z,roll,pitch,yaw) -> 4x4 homogeneous transform."""
+        x, y, z, roll, pitch, yaw = map(float, pose6)
+        T = np.eye(4, dtype=np.float64)
+        T[0:3, 0:3] = self._rpy_to_R(roll, pitch, yaw)
+        T[0:3, 3] = np.array([x, y, z], dtype=np.float64)
+        return T
+
+    def _T_to_pose6(self, T: np.ndarray):
+        """4x4 homogeneous transform -> (x,y,z,roll,pitch,yaw)."""
+        x, y, z = map(float, T[0:3, 3])
+        roll, pitch, yaw = self._R_to_rpy(T[0:3, 0:3])
+        return (float(x), float(y), float(z), float(roll), float(pitch), float(yaw))
+
+    def track_ID(self, display_frame):
+        # draw mask index (mask order)
+        fx, fy, cx, cy, W, H = self.cam_K
+        image_size = min(W, H) - self .offset2edge
+        res1 = None
+        if not self.bank_init:
+            id_map = self.bank.initialize(self.total_3dpoints, self.last_pose_cam2world, (fx, fy, cx, cy), (image_size, image_size))
+            self.bank_init = True
+        else:
+            res1 = self.bank.update(self.total_3dpoints, self.last_pose_cam2world)
+            id_map = res1.matched_ids
+
+        for i, (cX, cY) in enumerate(self.total_2dpoints):
+            if id_map is not None and i < len(id_map):
+                self._draw_mask_index(display_frame, int(cX), int(cY), int(id_map[i]))
+            else:
+                self._draw_mask_index(display_frame, int(cX), int(cY), i)
+        
+        if res1 is not None:
+            self.odometry = res1.odometry
+            if self.odometry is not None:
+                odom = float(res1.odometry)
+                odom = round(odom, 4) 
+                cv2.putText(display_frame, f'Odometry: {odom}', (10, 110),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            else:
+                cv2.putText(display_frame, f'Odometry: {self.odometry}', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
 
     def _init_sam3_if_needed(self):
         if self.model is not None:
@@ -337,15 +519,8 @@ class SAM3_Process(Node):
             'seg': (x1, y1, x2, y2),
         }
 
-    def _draw_mask_index(self, display_frame: np.ndarray, mask_u8: np.ndarray, idx: int, color=(255, 255, 255)):
-        """Draw mask index near its centroid."""
-        if display_frame is None or mask_u8 is None:
-            return
-        M = cv2.moments(mask_u8)
-        if M.get('m00', 0) == 0:
-            return
-        cX = int(M['m10'] / M['m00'])
-        cY = int(M['m01'] / M['m00'])
+    def _draw_mask_index(self, display_frame: np.ndarray, cX: int, cY: int, idx: int, color=(255, 255, 255)):
+
         text = str(idx)
         # outline for readability
         cv2.putText(display_frame, text, (cX, cY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
@@ -382,17 +557,21 @@ class SAM3_Process(Node):
         except Exception as e:
             self.get_logger().warn(f'SAM3 inference error: {e}')
             masks = None
-        fps = 1.0 / max(1e-6, (time.time() - t0))
+
+        # Time since first received color frame
+        if self._t0_first_color_frame is None:
+            # Fallback (shouldn't happen unless on_color wasn't called)
+            self._t0_first_color_frame = time.time()
+        frame_time_s = float(time.time() - self._t0_first_color_frame)
 
         depth_m = self._depth_to_meters(self.last_depth)
-        if self.cam_K is None:
-            # publish cropped overlay without 3D projection
-            fx = fy = cx = cy = 0.0
-            W = H = 0
-        else:
-            fx, fy, cx, cy, W, H = self.cam_K
+
+        fx, fy, cx, cy, W, H = self.cam_K
 
         display_frame = cv2.cvtColor(image_cropped, cv2.COLOR_RGB2BGR)
+
+        self.total_2dpoints = []
+        self.total_3dpoints = []
 
         if self.last_type == '0':  # points (solid point) -> sample depth INSIDE mask
             if masks is not None and masks.shape[0] > 0 and depth_m is not None and self.cam_K is not None:
@@ -407,14 +586,15 @@ class SAM3_Process(Node):
                     colored_mask[:, :, 2] = mask * (color[2] / 255)
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.35, 0)
 
-                    # draw mask index (mask order)
-                    self._draw_mask_index(display_frame, mask, i)
+                    
 
                     M = cv2.moments(mask)
                     if M["m00"] == 0:
                         continue
                     cX = int(M["m10"] / M["m00"])
                     cY = int(M["m01"] / M["m00"])
+
+                    # self._draw_mask_index(display_frame, int(cX), int(cY), i)# without memory bank
 
                     # inside-mask depth (map crop coords -> full coords)
                     inside_y, inside_x = np.where(mask > 0)
@@ -436,11 +616,16 @@ class SAM3_Process(Node):
                         X = (u_full - cx) / fx * Z
                         Y = (v_full - cy) / fy * Z
                         label = f'X:{X:.2f} Y:{Y:.2f} Z:{Z:.2f}m'
+
+                        self.total_2dpoints.append((cX, cY))
+                        self.total_3dpoints.append((X, Y, Z))
                     else:
                         label += ' No Depth'
 
                     cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
-                    cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                self.track_ID(display_frame)
 
         elif self.last_type == '1':  # lines
             if masks is not None and masks.shape[0] > 0 and depth_m is not None and self.cam_K is not None:
@@ -453,8 +638,7 @@ class SAM3_Process(Node):
                     colored[:, :, 2] = (m * 0.2).astype(np.uint8)
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored, 0.18, 0)
 
-                    # draw mask index
-                    self._draw_mask_index(display_frame, m, i)
+                    
 
                 # (B) fit ONE line per mask using all mask points (PCA)
                 fitted = []
@@ -509,19 +693,22 @@ class SAM3_Process(Node):
                             # (E) intersection of the two fitted lines (use their representative seg)
                             inter = self._segment_intersection(a['seg'], b['seg'])
                             if inter is not None:
-                                ix, iy = inter
-                                ix_i = int(np.clip(round(ix), 0, res - 1))
-                                iy_i = int(np.clip(round(iy), 0, res - 1))
+                                cX, cY = inter
+                                cX = int(np.clip(round(cX), 0, res - 1))
+                                cY = int(np.clip(round(cY), 0, res - 1))
 
-                                u_full = ix_i + start_x
-                                v_full = iy_i + start_y
+                                u_full = cX + start_x
+                                v_full = cY + start_y
                                 Z = self._median_depth_in_circle(depth_m, u_full, v_full, radius_px=8)
 
-                                label = f'({ix_i},{iy_i})'
+                                label = f'({cX},{cY})'
                                 if Z is not None:
                                     X = (u_full - cx) / fx * Z
                                     Y = (v_full - cy) / fy * Z
                                     label = f'X:{X:.2f} Y:{Y:.2f} Z:{Z:.2f}m'
+
+                                    self.total_2dpoints.append((cX, cY))
+                                    self.total_3dpoints.append((X, Y, Z))
                                 else:
                                     label += ' No Depth'
 
@@ -529,9 +716,11 @@ class SAM3_Process(Node):
                                 self._draw_infinite_line_on_crop(display_frame, a['seg'], res, (0, 255, 255), thickness=2)
                                 self._draw_infinite_line_on_crop(display_frame, b['seg'], res, (255, 255, 0), thickness=2)
 
-                                cv2.circle(display_frame, (ix_i, iy_i), 6, (0, 0, 255), -1)
-                                cv2.putText(display_frame, label, (ix_i + 10, iy_i), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                            (0, 255, 255), 2)
+                                cv2.circle(display_frame, (cX, cY), 6, (0, 0, 255), -1)
+                                # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                #             (0, 255, 255), 2)
+                                # draw mask index
+                self.track_ID(display_frame)
 
         elif self.last_type == '2':  # holes
             if masks is not None and masks.shape[0] > 0:
@@ -548,14 +737,13 @@ class SAM3_Process(Node):
 
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.5, 0)
 
-                    # draw mask index
-                    self._draw_mask_index(display_frame, mask, i)
-
                     # 计算并绘制中心点
                     M = cv2.moments(mask)
                     if M["m00"] != 0 and depth_m is not None and self.cam_K is not None:
                         cX = int(M["m10"] / M["m00"])
                         cY = int(M["m01"] / M["m00"])
+
+                        # self._draw_mask_index(display_frame, int(cX), int(cY), i) # without memory bank
 
                         kernel = np.ones((5, 5), np.uint8)
                         dilated_mask = cv2.dilate(mask, kernel, iterations=3)
@@ -587,19 +775,30 @@ class SAM3_Process(Node):
                             X = (u_full - cx) / fx * Z
                             Y = (v_full - cy) / fy * Z
                             label = f'X:{X:.2f} Y:{Y:.2f} Z:{Z:.2f}m'
+
+                            self.total_2dpoints.append((cX, cY))
+                            self.total_3dpoints.append((X, Y, Z))
                         else:
                             label += ' No Depth'
 
                         cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
                         # X-Y-Z
                         # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                self.track_ID(display_frame)
 
-        # Overlay fps and description
-        cv2.putText(display_frame, f'FPS: {fps:.2f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        # Overlay time and description
+        cv2.putText(
+            display_frame,
+            f'Time: {frame_time_s:.3f}s',
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
+            2,
+        )
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         self._enqueue_publish(display_frame, self.last_color_msg)
-
 
 def main():
     rclpy.init()

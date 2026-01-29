@@ -288,15 +288,24 @@ class MemoryBank:
                 if oi in used_obs or aj in used_alive:
                     continue
 
-                if dist <= self.match_threshold:
+                real_id = int(alive_ids[aj])
+
+                # Only accept a match if the observed point is within threshold.
+                # (Re-check vs the latest track position to avoid any subtle
+                # order effects and to match the intended semantics.)
+                dist_to_latest = float(np.linalg.norm(obs_world[oi] - new_positions[real_id]))
+                if dist <= self.match_threshold and dist_to_latest <= self.match_threshold:
                     used_obs.add(oi)
                     used_alive.add(aj)
 
-                    real_id = int(alive_ids[aj])
                     matched_ids[oi] = real_id
 
                     # Update current track position with the newly observed world point
                     new_positions[real_id] = obs_world[oi]
+                else:
+                    print(
+                        f"Point {oi} unmatched (closest dist {dist:.4f} > threshold {self.match_threshold:.4f})"
+                    )
 
             # Visible points are the only ones eligible for missed-count increase.
             visible_mask = self._visible_mask_current(pose)

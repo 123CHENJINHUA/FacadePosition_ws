@@ -15,8 +15,10 @@ def generate_launch_description():
     # Declare configurable launch arguments
     declare_enable_realsense = DeclareLaunchArgument('enable_realsense', default_value='true', description='Start RealSense camera')
 
-    declare_depth_topic = DeclareLaunchArgument('depth_topic', default_value='/camera/camera/aligned_depth_to_color/image_raw')
-    declare_color_topic = DeclareLaunchArgument('color_topic', default_value='/camera/camera/color/image_raw')
+    declare_depth_topic = DeclareLaunchArgument('depth_topic', default_value='/camera/camera_left/aligned_depth_to_color/image_raw')
+    declare_color_topic = DeclareLaunchArgument('color_topic', default_value='/camera/camera_left/color/image_raw')
+    declare_camera_info_topic = DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera_left/color/camera_info')
+    declare_tcp_pose_topic = DeclareLaunchArgument('tcp_pose_topic', default_value='/robot1_transform')
 
   
     # Include RealSense launch (if available)
@@ -61,7 +63,9 @@ def generate_launch_description():
         output='screen',
         parameters=[
             {'color_topic': LaunchConfiguration('color_topic')},
-            {'depth_topic': LaunchConfiguration('depth_topic')}
+            {'depth_topic': LaunchConfiguration('depth_topic')},
+            {'camera_info_topic': LaunchConfiguration('camera_info_topic')},
+            {'tcp_pose_topic': LaunchConfiguration('tcp_pose_topic')},
         ]
     )
 
@@ -71,6 +75,8 @@ def generate_launch_description():
     ld.add_action(declare_enable_realsense)
     ld.add_action(declare_depth_topic)
     ld.add_action(declare_color_topic)
+    ld.add_action(declare_camera_info_topic)
+    ld.add_action(declare_tcp_pose_topic)
     # ld.add_action(realsense_launch)
     ld.add_action(qwen_node)
     ld.add_action(img_show_node)
