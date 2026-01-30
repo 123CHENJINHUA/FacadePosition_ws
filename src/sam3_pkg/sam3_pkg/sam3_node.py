@@ -5,6 +5,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from qwen_pkg_interfaces.msg import QwenResponse
 
 from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PointStamped
 
 import numpy as np
 from PIL import Image as PILImage
@@ -53,6 +54,8 @@ class SAM3_Process(Node):
 
         # Publisher (publish processed overlay image)
         self.pub_result = self.create_publisher(Image, 'camera/sam3_result', 10)
+        # Publish each point position in world frame
+        self.pub_points_position = self.create_publisher(PointStamped, 'points_position', 10)
 
         # Publishing thread state (drop old frames to avoid backlog)
         self._pub_queue: "queue.Queue[tuple[np.ndarray, Image] | None]" = queue.Queue(maxsize=1)
@@ -107,6 +110,7 @@ class SAM3_Process(Node):
 
         # Hand-eye transform (TCP->Camera). Translation unit: meters.
         self.T_tcp_cam = self._load_hand_eye_4x4(self.hand_eye_path)
+        self.get_logger().info(f'Hand-eye matrix:\n{self.T_tcp_cam}')
         if self.T_tcp_cam is None:
             raise RuntimeError(f'Failed to load hand-eye matrix from: {self.hand_eye_path}')
 
@@ -329,6 +333,13 @@ class SAM3_Process(Node):
                 self._draw_mask_index(display_frame, int(cX), int(cY), int(id_map[i]))
             else:
                 self._draw_mask_index(display_frame, int(cX), int(cY), i)
+
+        # Publish world coordinates for each point (frame_id = id)
+        try:
+            if self.last_color_msg is not None:
+                self._publish_points_world(id_map, self.last_color_msg.header)
+        except Exception:
+            pass
         
         if res1 is not None:
             self.odometry = res1.odometry
@@ -578,6 +589,13 @@ class SAM3_Process(Node):
                 for i in range(masks.shape[0]):
                     mask = (masks[i, 0].astype(np.uint8) * 255)
 
+                    # # log mask size (pixel area)
+                    # try:
+                    #     area_px = int(np.count_nonzero(mask))
+                    #     self.get_logger().info(f'[SAM3] type=0 mask[{i}] area_px={area_px}')
+                    # except Exception:
+                    #     pass
+
                     # visualize mask (red)
                     color = (0, 0, 255)
                     colored_mask = np.zeros_like(display_frame, dtype=np.uint8)
@@ -586,15 +604,11 @@ class SAM3_Process(Node):
                     colored_mask[:, :, 2] = mask * (color[2] / 255)
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored_mask, 0.35, 0)
 
-                    
-
                     M = cv2.moments(mask)
                     if M["m00"] == 0:
                         continue
                     cX = int(M["m10"] / M["m00"])
                     cY = int(M["m01"] / M["m00"])
-
-                    # self._draw_mask_index(display_frame, int(cX), int(cY), i)# without memory bank
 
                     # inside-mask depth (map crop coords -> full coords)
                     inside_y, inside_x = np.where(mask > 0)
@@ -623,12 +637,19 @@ class SAM3_Process(Node):
                         label += ' No Depth'
 
                     cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
-                    # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
                 self.track_ID(display_frame)
 
         elif self.last_type == '1':  # lines
             if masks is not None and masks.shape[0] > 0 and depth_m is not None and self.cam_K is not None:
+                # log mask size (pixel area)
+                # for i in range(masks.shape[0]):
+                    # try:
+                    #     m_area = int(np.count_nonzero(masks[i, 0]))
+                    #     self.get_logger().info(f'[SAM3] type=1 mask[{i}] area_px={m_area}')
+                    # except Exception:
+                    #     pass
+
                 # (A) show ALL masks with a light overlay
                 for i in range(masks.shape[0]):
                     m = (masks[i, 0].astype(np.uint8) * 255)
@@ -637,8 +658,6 @@ class SAM3_Process(Node):
                     colored[:, :, 1] = (m * 0.6).astype(np.uint8)
                     colored[:, :, 2] = (m * 0.2).astype(np.uint8)
                     display_frame = cv2.addWeighted(display_frame, 1.0, colored, 0.18, 0)
-
-                    
 
                 # (B) fit ONE line per mask using all mask points (PCA)
                 fitted = []
@@ -717,15 +736,19 @@ class SAM3_Process(Node):
                                 self._draw_infinite_line_on_crop(display_frame, b['seg'], res, (255, 255, 0), thickness=2)
 
                                 cv2.circle(display_frame, (cX, cY), 6, (0, 0, 255), -1)
-                                # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                #             (0, 255, 255), 2)
-                                # draw mask index
                 self.track_ID(display_frame)
 
         elif self.last_type == '2':  # holes
             if masks is not None and masks.shape[0] > 0:
                 for i in range(masks.shape[0]):
                     mask = masks[i, 0]  # [resolution, resolution]
+
+                    # log mask size (pixel area)
+                    # try:
+                    #     area_px = int(np.count_nonzero(mask))
+                    #     self.get_logger().info(f'[SAM3] type=2 mask[{i}] area_px={area_px}')
+                    # except Exception:
+                    #     pass
 
                     mask = mask.astype(np.uint8) * 255
                     color = (255, 0, 0)
@@ -742,8 +765,6 @@ class SAM3_Process(Node):
                     if M["m00"] != 0 and depth_m is not None and self.cam_K is not None:
                         cX = int(M["m10"] / M["m00"])
                         cY = int(M["m01"] / M["m00"])
-
-                        # self._draw_mask_index(display_frame, int(cX), int(cY), i) # without memory bank
 
                         kernel = np.ones((5, 5), np.uint8)
                         dilated_mask = cv2.dilate(mask, kernel, iterations=3)
@@ -782,23 +803,65 @@ class SAM3_Process(Node):
                             label += ' No Depth'
 
                         cv2.circle(display_frame, (cX, cY), 5, (0, 255, 255), -1)
-                        # X-Y-Z
-                        # cv2.putText(display_frame, label, (cX + 10, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 self.track_ID(display_frame)
 
         # Overlay time and description
-        cv2.putText(
-            display_frame,
-            f'Time: {frame_time_s:.3f}s',
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2,
-        )
+        # cv2.putText(
+        #     display_frame,
+        #     f'Time: {frame_time_s:.3f}s',
+        #     (10, 30),
+        #     cv2.FONT_HERSHEY_SIMPLEX,
+        #     1,
+        #     (0, 0, 255),
+        #     2,
+        # )
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         self._enqueue_publish(display_frame, self.last_color_msg)
+
+    def _publish_points_world(self, id_map, color_header):
+        """Publish each point's world coordinates as PointStamped.
+
+        - topic: points_position
+        - header.frame_id: point id (string)
+        - point: world coordinates (meters)
+        """
+        if self.cam_K is None:
+            return
+        if self.last_pose_cam2world is None:
+            return
+        if not self.total_3dpoints:
+            return
+
+        try:
+            T_base_cam = self._pose6_to_T(self.last_pose_cam2world)  # base/world <- cam
+        except Exception:
+            return
+
+        for i, p_cam in enumerate(self.total_3dpoints):
+            if p_cam is None:
+                continue
+            try:
+                Xc, Yc, Zc = map(float, p_cam)
+            except Exception:
+                continue
+
+            pid = None
+            if id_map is not None and i < len(id_map):
+                pid = id_map[i]
+            else:
+                pid = i
+
+            p_cam_h = np.array([Xc, Yc, Zc, 1.0], dtype=np.float64)
+            p_w = (T_base_cam @ p_cam_h).reshape(-1)
+
+            msg = PointStamped()
+            msg.header = color_header
+            msg.header.frame_id = str(int(pid))
+            msg.point.x = float(p_w[0])
+            msg.point.y = float(p_w[1])
+            msg.point.z = float(p_w[2])
+            self.pub_points_position.publish(msg)
 
 def main():
     rclpy.init()

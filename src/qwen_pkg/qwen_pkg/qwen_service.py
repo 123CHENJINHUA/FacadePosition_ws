@@ -72,8 +72,17 @@ class QwenServiceNode(Node):
         self.camera1_image = None
         self.camera2_image = None
 
-        self.sub1 = self.create_subscription(Image, '/camera/camera/color/image_raw', self._camera1_cb, 10)
-        self.sub2 = self.create_subscription(Image, '/camera/camera/depth/image_raw', self._camera2_cb, 10)
+        # Make topics configurable from launch
+        self.declare_parameter('camera1_topic', '/camera/camera/color/image_raw')
+        self.declare_parameter('camera2_topic', '/camera/camera/depth/image_raw')
+        cam1_topic = self.get_parameter('camera1_topic').get_parameter_value().string_value
+        cam2_topic = self.get_parameter('camera2_topic').get_parameter_value().string_value
+
+        self.get_logger().info(f'Subscribing camera1_topic={cam1_topic}')
+        self.get_logger().info(f'Subscribing camera2_topic={cam2_topic}')
+
+        self.sub1 = self.create_subscription(Image, cam1_topic, self._camera1_cb, 10)
+        self.sub2 = self.create_subscription(Image, cam2_topic, self._camera2_cb, 10)
 
         # Publisher for response content
         self.response_pub = self.create_publisher(QwenResponse, 'qwen_service/response', 10)
@@ -136,7 +145,7 @@ class QwenServiceNode(Node):
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": image_b64_url}},
-                {"type": "text", "text": "Please output only JSON, without any explanations, prefixes or suffixes. The format is: {\"description\": <string>, \"type\": <int>, \"reason\": <string>}"}
+                {"type": "text", "text": "Please output only JSON, without any explanations, prefixes or suffixes.The format is: {\"description\": <string>, \"type\": <int>, \"reason\": <string>}"}
             ]
         })
         completion = self.client.chat.completions.create(
@@ -149,7 +158,7 @@ class QwenServiceNode(Node):
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": image_b64_url}},
-                {"type": "text", "text": "Please output only JSON, without any explanations, prefixes or suffixes. The format is: {\"description\": <string>, \"type\": <int>, \"reason\": <string>}"}
+                {"type": "text", "text": "Please output only JSON, without any explanations, prefixes or suffixes.The format is: {\"description\": <string>, \"type\": <int>, \"reason\": <string>}"}
             ]
         })
         self.messages.append({"role": "assistant", "content": assistant_response})
