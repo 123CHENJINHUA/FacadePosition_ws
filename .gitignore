@@ -7,4 +7,6 @@ log/
 src/sam3_pkg/sam3_pkg/weight/
 src/qwen_pkg/images/
 
+videos/
+
 *.mp4
