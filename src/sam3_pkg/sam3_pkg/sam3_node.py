@@ -353,8 +353,6 @@ class SAM3_Process(Node):
         for i, (cX, cY) in enumerate(self.total_2dpoints):
             if id_map is not None and i < len(id_map):
                 _draw_mask_index(display_frame, int(cX), int(cY), int(id_map[i]))
-            else:
-                _draw_mask_index(display_frame, int(cX), int(cY), i)
 
         # Publish world coordinates for each point (frame_id = id)
         try:
