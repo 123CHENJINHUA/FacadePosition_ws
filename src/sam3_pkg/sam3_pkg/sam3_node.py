@@ -88,6 +88,9 @@ class SAM3_Process(Node):
         self.odometry = None
         self.offset2edge = 0
 
+        # NEW: request to reinitialize MemoryBank init points on next frame
+        self._reinit_bank_pending: bool = False
+
         # SAM3 model lazily initialized on first frame
         self.model = None
         self.processor = None
@@ -178,9 +181,21 @@ class SAM3_Process(Node):
                     pass
 
     def on_qwen(self, msg: QwenResponse):
-        self.last_description = (msg.description or '').strip()
-        self.last_type = (msg.type or '').strip()
-        self.last_reason = (msg.reason or '').strip()
+        new_desc = (msg.description or '').strip()
+        new_type = (msg.type or '').strip()
+        new_reason = (msg.reason or '').strip()
+
+        # Detect actual change
+        changed = (new_desc != getattr(self, 'last_description', '')) or (new_type != getattr(self, 'last_type', '')) or (new_reason != getattr(self, 'last_reason', ''))
+
+        self.last_description = new_desc
+        self.last_type = new_type
+        self.last_reason = new_reason
+
+        # If prompt/type changed, reinitialize init_world points using next valid observation.
+        # NOTE: we keep this node's `self.odometry` value (display state) untouched.
+        if changed:
+            self._reinit_bank_pending = True
 
     def on_camera_info(self, msg: CameraInfo):
         # Extract intrinsics
@@ -362,6 +377,16 @@ class SAM3_Process(Node):
         fx, fy, cx, cy, W, H = self.cam_K
         image_size = min(W, H) - self .offset2edge
         res1 = None
+
+        # If requested, restart MemoryBank initialization using current observed points as new init points.
+        if self._reinit_bank_pending:
+            try:
+                self.bank = MemoryBank(match_threshold=0.01, max_missed_frames=30000)
+                self.bank_init = False
+            except Exception:
+                pass
+            self._reinit_bank_pending = False
+
         if not self.bank_init:
             id_map = self.bank.initialize(self.total_3dpoints, self.last_pose_cam2world, (fx, fy, cx, cy), (image_size, image_size))
             self.bank_init = True
