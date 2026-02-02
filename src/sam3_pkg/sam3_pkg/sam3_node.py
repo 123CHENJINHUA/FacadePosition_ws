@@ -73,6 +73,13 @@ class SAM3_Process(Node):
         # camera pose (world): (x,y,z,roll,pitch,yaw)
         self.last_pose_cam2world = None
 
+        # NEW: sync caches (ROS time in seconds)
+        self._last_color_stamp_s: float | None = None
+        self._last_depth_stamp_s: float | None = None
+        self._last_pose_stamp_s: float | None = None
+        # accept messages within this window
+        self._sync_slop_s: float = 0.05
+
         # MemoryBank for stable IDs
         self.bank = MemoryBank(match_threshold=0.01, max_missed_frames=30000)
         self.bank_init = False
@@ -183,6 +190,32 @@ class SAM3_Process(Node):
         cy = msg.k[5]
         self.cam_K = (fx, fy, cx, cy, msg.width, msg.height)
 
+    def _stamp_to_sec(self, stamp) -> float:
+        """Convert builtin_interfaces/Time to float seconds."""
+        try:
+            return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        except Exception:
+            return float('nan')
+
+    def _synced_ready(self) -> bool:
+        """True if color/depth/pose are present and within timestamp tolerance."""
+        if self._last_color_stamp_s is None or self._last_depth_stamp_s is None or self._last_pose_stamp_s is None:
+            return False
+        if self.last_color is None or self.last_color_msg is None:
+            return False
+        if self.last_depth is None:
+            return False
+        if self.last_pose_cam2world is None:
+            return False
+
+        t0 = self._last_color_stamp_s
+        # all must be close to color stamp
+        if abs(self._last_depth_stamp_s - t0) > self._sync_slop_s:
+            return False
+        if abs(self._last_pose_stamp_s - t0) > self._sync_slop_s:
+            return False
+        return True
+
     def on_color(self, msg: Image):
         if self.bridge is None:
             return
@@ -191,14 +224,19 @@ class SAM3_Process(Node):
             self._t0_first_color_frame = time.time()
 
         self.last_color_msg = msg
+        self._last_color_stamp_s = self._stamp_to_sec(msg.header.stamp)
         self.last_color = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        self.try_process_and_publish()
+
+        # Only process when depth+pose are aligned to this color frame
+        if self._synced_ready():
+            self.try_process_and_publish()
 
     def on_depth(self, msg: Image):
         if self.bridge is None:
             return
         # Keep encoding to infer scale
         self.depth_encoding = msg.encoding
+        self._last_depth_stamp_s = self._stamp_to_sec(msg.header.stamp)
         depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         self.last_depth = depth
 
@@ -238,6 +276,9 @@ class SAM3_Process(Node):
     def on_tcp_pose(self, msg: TransformStamped):
         # Expected TransformStamped with translation (m) and rotation quaternion (x,y,z,w)
         try:
+            # cache timestamp for sync
+            self._last_pose_stamp_s = self._stamp_to_sec(msg.header.stamp)
+
             t = msg.transform.translation
             q = msg.transform.rotation
 
@@ -537,6 +578,109 @@ class SAM3_Process(Node):
         cv2.putText(display_frame, text, (cX, cY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
         cv2.putText(display_frame, text, (cX, cY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
+    def _project_world_points_to_full_pixels(self, points_world: np.ndarray, pose6_cam_in_world):
+        """Project Nx3 world points to full-image pixels.
+
+        Args:
+            points_world: (N,3) world points.
+            pose6_cam_in_world: camera pose in world (x,y,z,roll,pitch,yaw).
+
+        Returns:
+            uv_full: (N,2) float pixel coordinates in full image.
+            valid: (N,) bool mask: in front of camera and inside image bounds.
+        """
+        if points_world is None:
+            return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=bool)
+        if self.cam_K is None or pose6_cam_in_world is None:
+            return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=bool)
+
+        fx, fy, cx, cy, W, H = self.cam_K
+        pts_w = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+        if pts_w.size == 0:
+            return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=bool)
+
+        # world <- cam
+        T_w_c = self._pose6_to_T(pose6_cam_in_world)
+        R_w_c = T_w_c[0:3, 0:3]
+        t_w_c = T_w_c[0:3, 3]
+
+        # cam <- world
+        pts_c = (R_w_c.T @ (pts_w - t_w_c).T).T
+        z = pts_c[:, 2]
+        valid = z > 1e-6
+
+        u = fx * (pts_c[:, 0] / z) + cx
+        v = fy * (pts_c[:, 1] / z) + cy
+        uv = np.stack([u, v], axis=1)
+
+        valid &= (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+        return uv, valid
+
+    def _draw_world_points_on_crop(
+        self,
+        display_frame: np.ndarray,
+        points_world: np.ndarray,
+        prefix: str,
+        start_x: int,
+        start_y: int,
+        res: int,
+        color,
+    ):
+        """Draw projected world points onto cropped image.
+
+        Args:
+            display_frame: crop (res x res) BGR image.
+            points_world: (N,3) points in world.
+            prefix: label prefix, e.g. 'I' or 'C'.
+            start_x/start_y: crop origin in full image.
+            res: crop size.
+            color: BGR tuple.
+        """
+        if points_world is None:
+            return
+        if self.last_pose_cam2world is None or self.cam_K is None:
+            return
+
+        uv_full, valid = self._project_world_points_to_full_pixels(points_world, self.last_pose_cam2world)
+        if uv_full.shape[0] == 0:
+            return
+
+        for pid in range(uv_full.shape[0]):
+            if not bool(valid[pid]):
+                continue
+            u_full, v_full = float(uv_full[pid, 0]), float(uv_full[pid, 1])
+
+            # full -> crop
+            u = int(round(u_full - start_x))
+            v = int(round(v_full - start_y))
+            if not (0 <= u < res and 0 <= v < res):
+                continue
+
+            cv2.circle(display_frame, (u, v), 4, color, -1)
+            cv2.putText(
+                display_frame,
+                f'{prefix}{pid}',
+                (u + 6, v - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+            )
+
+    def _draw_bank_world_points(self, display_frame: np.ndarray, start_x: int, start_y: int, res: int):
+        """Draw both init and current world points from MemoryBank on the crop."""
+        if not getattr(self, 'bank_init', False):
+            return
+        try:
+            init_w = self.bank.init_world_points
+            cur_w = self.bank.current_world_points
+        except Exception:
+            return
+
+        # Init: magenta, Current: green
+        self._draw_world_points_on_crop(display_frame, init_w, 'I', start_x, start_y, res, (255, 0, 255))
+        self._draw_world_points_on_crop(display_frame, cur_w, 'C', start_x, start_y, res, (0, 255, 0))
+
     def try_process_and_publish(self):
 
         if self.last_color is None or self.last_color_msg is None:
@@ -816,6 +960,9 @@ class SAM3_Process(Node):
         #     2,
         # )
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # NEW: draw all init/current world points (when bank has been initialized)
+        self._draw_bank_world_points(display_frame, start_x, start_y, res)
 
         self._enqueue_publish(display_frame, self.last_color_msg)
 

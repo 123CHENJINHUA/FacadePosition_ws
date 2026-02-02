@@ -302,10 +302,10 @@ class MemoryBank:
 
                     # Update current track position with the newly observed world point
                     new_positions[real_id] = obs_world[oi]
-                else:
-                    print(
-                        f"Point {oi} unmatched (closest dist {dist:.4f} > threshold {self.match_threshold:.4f})"
-                    )
+                # else:
+                #     print(
+                #         f"Point {oi} unmatched (closest dist {dist:.4f} > threshold {self.match_threshold:.4f})"
+                #     )
 
             # Visible points are the only ones eligible for missed-count increase.
             visible_mask = self._visible_mask_current(pose)
