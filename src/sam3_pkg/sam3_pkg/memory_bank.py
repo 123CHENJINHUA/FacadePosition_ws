@@ -176,6 +176,7 @@ class MemoryBank:
         pose: Pose6,
         intrinsics: Tuple[float, float, float, float],
         image_size: Tuple[int, int],
+        remain_odometry: bool = False,
     ) -> List[int]:
         """Initialize the bank.
 
@@ -203,7 +204,9 @@ class MemoryBank:
         self._lost_mask = np.zeros((len(pts_world_ordered),), dtype=bool)
         self._miss_counts = np.zeros((len(pts_world_ordered),), dtype=int)
         self._initialized = True
-        self._odometry = 0.0
+
+        if not remain_odometry:
+            self._odometry = 0.0
 
         inv = np.empty((len(order),), dtype=int)
         for new_id, old_i in enumerate(order):
@@ -363,10 +366,3 @@ class MemoryBank:
             return UpdateResult(matched_ids=None, odometry=self._odometry, tracking_lost=False)
 
         return UpdateResult(matched_ids=matched_ids, odometry=self._odometry, tracking_lost=False)
-
-
-__all__ = [
-    "MemoryBank",
-    "UpdateResult",
-    "camera_points_to_world",
-]
