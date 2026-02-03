@@ -351,7 +351,7 @@ class SAM3_Process(Node):
             id_map = res1.matched_ids
 
         for i, (cX, cY) in enumerate(self.total_2dpoints):
-            if id_map is not None and i < len(id_map):
+            if id_map is not None and i < len(id_map) and id_map[i] >= 0:
                 _draw_mask_index(display_frame, int(cX), int(cY), int(id_map[i]))
 
         # Publish world coordinates for each point (frame_id = id)
@@ -669,9 +669,10 @@ class SAM3_Process(Node):
         # )
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
+        ## debug
         #draw all init/current world points (when bank has been initialized)
-        _draw_bank_world_points(display_frame, start_x, start_y, res, init_w = self.bank.init_world_points,
-        cur_w = self.bank.current_world_points,last_pose_cam2world = self.last_pose_cam2world,cam_K=self.cam_K)
+        # _draw_bank_world_points(display_frame, start_x, start_y, res, init_w = self.bank.init_world_points,
+        # cur_w = self.bank.current_world_points,last_pose_cam2world = self.last_pose_cam2world,cam_K=self.cam_K)
 
         self._enqueue_publish(display_frame, self.last_color_msg)
 

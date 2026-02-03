@@ -26,6 +26,7 @@ setup(
             'qwen_client = qwen_pkg.qwen_client:main',
             'image_publisher = qwen_pkg.image_publisher:main',
             'image_show = qwen_pkg.image_show:main',
+            'qwen_service_sim = qwen_pkg.qwen_service_sim:main',
         ],
     },
 )
