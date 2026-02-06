@@ -15,9 +15,9 @@ def generate_launch_description():
     # Declare configurable launch arguments
     declare_enable_realsense = DeclareLaunchArgument('enable_realsense', default_value='true', description='Start RealSense camera')
 
-    declare_depth_topic = DeclareLaunchArgument('depth_topic', default_value='/camera/camera/aligned_depth_to_color/image_raw')
-    declare_color_topic = DeclareLaunchArgument('color_topic', default_value='/camera/camera/color/image_raw')
-    declare_camera_info_topic = DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera/color/camera_info')
+    declare_depth_topic = DeclareLaunchArgument('depth_topic', default_value='/camera/camera_left/aligned_depth_to_color/image_raw')
+    declare_color_topic = DeclareLaunchArgument('color_topic', default_value='/camera/camera_left/color/image_raw')
+    declare_camera_info_topic = DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera_left/color/camera_info')
     declare_tcp_pose_topic = DeclareLaunchArgument('tcp_pose_topic', default_value='/robot1_transform')
 
   

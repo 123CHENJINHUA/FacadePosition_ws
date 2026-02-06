@@ -91,30 +91,30 @@ class ImageShow(Node):
 
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
-        # Estimate fps from ROS header stamps if available
-        try:
-            stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
-            if self._last_stamp_sec is not None:
-                dt = stamp_sec - self._last_stamp_sec
-                if dt > 1e-4:
-                    fps_est = 1.0 / dt
-                    # Limit to reasonable range to avoid spikes
-                    if 1.0 <= fps_est <= 120.0:
-                        self._fps = float(fps_est)
-            self._last_stamp_sec = stamp_sec
-        except Exception:
-            pass
+        # # Estimate fps from ROS header stamps if available
+        # try:
+        #     stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        #     if self._last_stamp_sec is not None:
+        #         dt = stamp_sec - self._last_stamp_sec
+        #         if dt > 1e-4:
+        #             fps_est = 1.0 / dt
+        #             # Limit to reasonable range to avoid spikes
+        #             if 1.0 <= fps_est <= 120.0:
+        #                 self._fps = float(fps_est)
+        #     self._last_stamp_sec = stamp_sec
+        # except Exception:
+        #     pass
 
-        self._ensure_writer(frame)
+        # self._ensure_writer(frame)
 
-        # Ensure the frame matches writer resolution (pad if smaller)
-        frame_for_write = self._pad_to_writer_size(frame)
+        # # Ensure the frame matches writer resolution (pad if smaller)
+        # frame_for_write = self._pad_to_writer_size(frame)
 
-        if self._writer is not None:
-            try:
-                self._writer.write(frame_for_write)
-            except Exception as e:
-                self.get_logger().warn(f'VideoWriter write failed: {e}')
+        # if self._writer is not None:
+        #     try:
+        #         self._writer.write(frame_for_write)
+        #     except Exception as e:
+        #         self.get_logger().warn(f'VideoWriter write failed: {e}')
 
         if cv2 is not None:
             cv2.imshow('camera', frame)
