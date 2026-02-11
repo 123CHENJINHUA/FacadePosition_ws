@@ -20,7 +20,7 @@ from .sam3 import build_sam3_image_model
 from .sam3.model.sam3_image_processor import Sam3Processor
 
 from .memory_bank import MemoryBank
-from .sam3node_utils import _T_to_pose6,_pose6_to_T,_depth_to_meters,_median_depth_in_circle,_segment_intersection,_fit_line_from_mask_points
+from .sam3node_utils import _T_to_pose6,_pose6_to_T,_depth_to_meters,_median_depth_in_circle,_segment_intersection,_fit_line_from_mask_points, apply_nms_to_masks
 from .vis import _draw_infinite_line_on_crop,_draw_bank_world_points,_draw_mask_index
 
 import threading
@@ -83,7 +83,7 @@ class SAM3_Process(Node):
         self._sync_slop_s: float = 0.05
 
         # MemoryBank for stable IDs
-        self.bank = MemoryBank(match_threshold=0.01, max_missed_frames=30000)
+        self.bank = MemoryBank(match_threshold=0.01, max_missed_frames=300)
         self.bank_init = False
         self.total_3dpoints = []
         self.total_2dpoints = []
@@ -417,6 +417,7 @@ class SAM3_Process(Node):
             masks = state.get('masks')
             if masks is not None:
                 masks = masks.cpu().numpy()  # [N,1,H,W]
+                masks = apply_nms_to_masks(masks, iou_threshold=0.3)
         except Exception as e:
             self.get_logger().warn(f'SAM3 inference error: {e}')
             masks = None
@@ -669,8 +670,8 @@ class SAM3_Process(Node):
         # )
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        ## debug
-        #draw all init/current world points (when bank has been initialized)
+        # # debug
+        # # draw all init/current world points (when bank has been initialized)
         # _draw_bank_world_points(display_frame, start_x, start_y, res, init_w = self.bank.init_world_points,
         # cur_w = self.bank.current_world_points,last_pose_cam2world = self.last_pose_cam2world,cam_K=self.cam_K)
 

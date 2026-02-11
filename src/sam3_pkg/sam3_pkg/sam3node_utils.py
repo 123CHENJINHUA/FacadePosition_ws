@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+import torchvision.ops as ops
 
 def _rpy_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
     """Convert roll/pitch/yaw (radians, ZYX) to rotation matrix."""
@@ -191,3 +193,40 @@ def _project_world_points_to_full_pixels(points_world: np.ndarray, pose6_cam_in_
 
     valid &= (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
     return uv, valid
+
+
+def apply_nms_to_masks(masks, scores=None, iou_threshold=0.5):
+    """
+    对masks进行NMS去重
+    masks: [N, 1, H, W]
+    scores: [N] 或 None（使用mask面积作为分数）
+    """
+    if masks is None or masks.shape[0] <= 1:
+        return masks
+        
+    # 计算bounding boxes
+    N = masks.shape[0]
+    boxes = []
+    for i in range(N):
+        mask = masks[i, 0] > 0
+        if not mask.any():
+            boxes.append([0, 0, 0, 0])
+            continue
+            
+        y_idx, x_idx = np.where(mask)
+        boxes.append([
+            float(x_idx.min()), float(y_idx.min()),
+            float(x_idx.max()), float(y_idx.max())
+        ])
+    
+    boxes = torch.tensor(boxes, dtype=torch.float32)
+    
+    # 使用mask面积作为分数（如果没有提供scores）
+    if scores is None:
+        areas = [(mask > 0).sum() for mask in masks[:, 0]]
+        scores = torch.tensor(areas, dtype=torch.float32)
+    
+    # 执行NMS
+    keep_indices = ops.nms(boxes, scores, iou_threshold)
+    
+    return masks[keep_indices.cpu().numpy()]
