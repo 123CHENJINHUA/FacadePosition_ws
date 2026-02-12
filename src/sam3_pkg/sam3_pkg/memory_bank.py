@@ -333,6 +333,23 @@ class MemoryBank:
                 if self._miss_counts[idx_i] > self.max_missed_frames:
                     self._lost_mask[idx_i] = True
 
+            # Apply mean offset of matched points to unmatched alive points
+            if used_obs:
+                deltas = []
+                for oi in used_obs:
+                    mid = matched_ids[oi]
+                    if mid >= 0:
+                        deltas.append(obs_world[oi] - self._cur_world[mid])
+
+                if deltas:
+                    mean_delta = np.mean(np.stack(deltas, axis=0), axis=0)
+                    matched_id_set = {matched_ids[oi] for oi in used_obs if matched_ids[oi] >= 0}
+                    for idx in alive_ids:
+                        idx_i = int(idx)
+                        if idx_i in matched_id_set:
+                            continue
+                        new_positions[idx_i] = new_positions[idx_i] + mean_delta
+
             # Commit the new current positions (do not touch init positions)
             self._cur_world = new_positions
         else:
