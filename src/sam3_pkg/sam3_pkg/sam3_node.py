@@ -58,6 +58,8 @@ class SAM3_Process(Node):
         self.pub_result = self.create_publisher(Image, 'camera/sam3_result', 10)
         # Publish each point position in world frame
         self.pub_points_position = self.create_publisher(PointStamped, 'points_position', 10)
+        # Publish odometry displacement (dx,dy,dz) as PointStamped
+        self.pub_odometry = self.create_publisher(PointStamped, 'sam3/odometry', 10)
 
         # Publishing thread state (drop old frames to avoid backlog)
         self._pub_queue: "queue.Queue[tuple[np.ndarray, Image] | None]" = queue.Queue(maxsize=1)
@@ -83,7 +85,7 @@ class SAM3_Process(Node):
         self._sync_slop_s: float = 0.05
 
         # MemoryBank for stable IDs
-        self.bank = MemoryBank(match_threshold=0.05, max_missed_frames=300)
+        self.bank = MemoryBank(match_threshold=0.03, max_missed_frames=300)
         self.bank_init = False
         self.total_3dpoints = []
         self.total_2dpoints = []
@@ -364,12 +366,32 @@ class SAM3_Process(Node):
         if res1 is not None:
             self.odometry = res1.odometry
             if self.odometry is not None:
-                odom = float(res1.odometry)
-                odom = round(odom, 4) 
-                cv2.putText(display_frame, f'Odometry: {odom}', (10, 110),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            else:
-                cv2.putText(display_frame, f'Odometry: {self.odometry}', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                dx, dy, dz = self.odometry
+                dx = round(float(dx), 4)
+                dy = round(float(dy), 4)
+                dz = round(float(dz), 4)
+
+                # Publish odometry
+                try:
+                    odom_msg = PointStamped()
+                    if self.last_color_msg is not None:
+                        odom_msg.header = self.last_color_msg.header
+                    odom_msg.point.x = float(dx)
+                    odom_msg.point.y = float(dy)
+                    odom_msg.point.z = float(dz)
+                    self.pub_odometry.publish(odom_msg)
+                except Exception:
+                    pass
+
+                cv2.putText(
+                    display_frame,
+                    f'Odometry: dx={dx} dy={dy} dz={dz}',
+                    (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
             
 
     def _init_sam3_if_needed(self):

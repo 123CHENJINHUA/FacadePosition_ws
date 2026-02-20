@@ -25,7 +25,7 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import math
 
@@ -34,6 +34,7 @@ import numpy as np
 
 Vec3 = Tuple[float, float, float]
 Pose6 = Tuple[float, float, float, float, float, float]  # x,y,z,roll,pitch,yaw
+Odometry3 = Tuple[float, float, float]
 
 
 def _rpy_to_rot(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -118,7 +119,8 @@ def _pairwise_dist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 @dataclass
 class UpdateResult:
     matched_ids: Optional[List[int]]
-    odometry: Optional[float]
+    # Mean displacement (dx, dy, dz) from initial points to the newly observed matched points.
+    odometry: Optional[Odometry3]
     tracking_lost: bool
 
 
@@ -151,8 +153,8 @@ class MemoryBank:
         # Consecutive missed-frame counter per id (only meaningful while not lost).
         self._miss_counts: np.ndarray = np.zeros((0,), dtype=int)
 
-        # Latest odometry value
-        self._odometry: Optional[float] = None
+        # Latest odometry value (dx, dy, dz)
+        self._odometry: Optional[Odometry3] = None
 
     @property
     def initialized(self) -> bool:
@@ -167,7 +169,7 @@ class MemoryBank:
         return self._cur_world.copy()
 
     @property
-    def odometry(self) -> Optional[float]:
+    def odometry(self) -> Optional[Odometry3]:
         return self._odometry
 
     def initialize(
@@ -206,7 +208,7 @@ class MemoryBank:
         self._initialized = True
 
         if not remain_odometry:
-            self._odometry = 0.0
+            self._odometry = (0.0, 0.0, 0.0)
 
         inv = np.empty((len(order),), dtype=int)
         for new_id, old_i in enumerate(order):
@@ -244,8 +246,8 @@ class MemoryBank:
               - matched_ids: IDs of matched points in the same order as the
                 provided `points_cam`. For unmatched points: -1.
                 If *all* tracked points are lost/unmatched -> None.
-              - odometry: mean distance of matched observed points to their
-                corresponding *initial* world positions.
+              - odometry: mean displacement (dx, dy, dz) of matched observed
+                points relative to their corresponding *initial* world positions.
               - tracking_lost: True if at least one point exceeds threshold.
         """
 
@@ -368,14 +370,16 @@ class MemoryBank:
             self._odometry = None
             return UpdateResult(matched_ids=None, odometry=None, tracking_lost=True)
 
-        # Odometry: mean distance from matched observed points to initial positions
-        odom_vals: List[float] = []
+        # Odometry: mean displacement vector from matched observed points to initial positions
+        odom_vecs: List[np.ndarray] = []
         for oi, mid in enumerate(matched_ids):
             if mid < 0:
                 continue
-            odom_vals.append(float(np.linalg.norm(obs_world[oi] - self._init_world[mid])))
+            odom_vecs.append(obs_world[oi] - self._init_world[mid])
 
-        self._odometry = float(np.mean(odom_vals)) if odom_vals else self._odometry
+        if odom_vecs:
+            mean_delta = np.mean(np.stack(odom_vecs, axis=0), axis=0)
+            self._odometry = (float(mean_delta[0]), float(mean_delta[1]), float(mean_delta[2]))
 
         # If no points matched in this frame, do NOT declare overall tracking lost
         # (points may re-appear within max_missed_frames)
