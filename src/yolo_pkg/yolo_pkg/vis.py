@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from .sam3node_utils import _project_world_points_to_full_pixels
+from .utils import _project_world_points_to_full_pixels
 
 def _draw_infinite_line_on_crop(frame_bgr: np.ndarray, seg, res: int, color, thickness: int = 2):
     """Draw an infinite line (defined by a segment) across the crop image boundaries."""

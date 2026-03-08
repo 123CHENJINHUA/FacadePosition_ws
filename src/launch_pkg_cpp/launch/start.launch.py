@@ -73,6 +73,19 @@ def generate_launch_description():
         ]
     )
 
+    yolo_node = Node(
+        package='yolo_pkg',
+        executable='yolo_node',
+        name='yolo_node',
+        output='screen',
+        parameters=[
+            {'color_topic': LaunchConfiguration('color_topic')},
+            {'depth_topic': LaunchConfiguration('depth_topic')},
+            {'camera_info_topic': LaunchConfiguration('camera_info_topic')},
+            {'tcp_pose_topic': LaunchConfiguration('tcp_pose_topic')},
+        ]
+    )
+
 
     ld = LaunchDescription()
 
@@ -85,6 +98,7 @@ def generate_launch_description():
     ld.add_action(qwen_node)
     ld.add_action(img_show_node)
     ld.add_action(sam3_node)
+    # ld.add_action(yolo_node)
 
     return ld
 

@@ -153,6 +153,12 @@ class MemoryBank:
         # Consecutive missed-frame counter per id (only meaningful while not lost).
         self._miss_counts: np.ndarray = np.zeros((0,), dtype=int)
 
+        # Per-point odometry baseline at the time the point was first added.
+        # When a new point joins mid-way, its birth_odom = current global odometry,
+        # so its contribution to global odometry = (obs - init) + birth_odom,
+        # which equals (incremental displacement since joining) + (historical odometry).
+        self._birth_odom: np.ndarray = np.zeros((0, 3), dtype=float)
+
         # Latest odometry value (dx, dy, dz)
         self._odometry: Optional[Odometry3] = None
 
@@ -205,6 +211,9 @@ class MemoryBank:
         self._cur_world = pts_world_ordered.copy()
         self._lost_mask = np.zeros((len(pts_world_ordered),), dtype=bool)
         self._miss_counts = np.zeros((len(pts_world_ordered),), dtype=int)
+        # All points initialized together share the same birth_odom = current odometry
+        base = np.array(self._odometry if self._odometry is not None else (0.0, 0.0, 0.0), dtype=float)
+        self._birth_odom = np.tile(base.reshape(1, 3), (len(pts_world_ordered), 1))
         self._initialized = True
 
         if not remain_odometry:
@@ -353,28 +362,42 @@ class MemoryBank:
                     self._lost_mask = np.concatenate([self._lost_mask, np.array([False], dtype=bool)])
                     self._miss_counts = np.concatenate([self._miss_counts, np.array([0], dtype=int)])
 
+                    # birth_odom = current global odometry at the moment this point joins.
+                    # Later: total_odom for this point = (obs - init) + birth_odom
+                    base = np.array(self._odometry if self._odometry is not None else (0.0, 0.0, 0.0), dtype=float)
+                    self._birth_odom = np.vstack([self._birth_odom, base.reshape(1, 3)])
+
                     # Keep consistent with this frame's commit
                     new_positions = np.vstack([new_positions, obs_world[oi][None, :]])
 
                     matched_ids[oi] = new_id
                     matched_id_set.add(new_id)
 
-            # Apply mean offset of matched points to unmatched alive points
+            # Apply mean offset of matched points to unmatched alive points.
+            # mean_delta here is the mean incremental displacement this frame
+            # (obs_world - cur_world for matched pairs), which represents the
+            # rigid-body motion of the scene in this frame.
+            # Since all points share the same physical motion, we apply this
+            # incremental delta uniformly to unmatched points regardless of
+            # their individual birth_odom (birth_odom is only relevant for
+            # computing global odometry, not for position updates).
             if used_obs:
                 deltas = []
                 for oi in used_obs:
                     mid = matched_ids[oi]
                     if mid >= 0:
+                        # incremental displacement this frame: obs - previous cur
                         deltas.append(obs_world[oi] - self._cur_world[mid])
 
                 if deltas:
-                    mean_delta = np.mean(np.stack(deltas, axis=0), axis=0)
+                    mean_incremental = np.mean(np.stack(deltas, axis=0), axis=0)
                     matched_id_set = {matched_ids[oi] for oi in used_obs if matched_ids[oi] >= 0}
                     for idx in alive_ids:
                         idx_i = int(idx)
                         if idx_i in matched_id_set:
                             continue
-                        new_positions[idx_i] = new_positions[idx_i] + mean_delta
+                        # Apply the same incremental motion to unmatched alive points
+                        new_positions[idx_i] = new_positions[idx_i] + mean_incremental
 
             # Commit the new current positions (do not touch init positions)
             self._cur_world = new_positions
@@ -394,18 +417,22 @@ class MemoryBank:
             self._odometry = None
             return UpdateResult(matched_ids=None, odometry=None, tracking_lost=True)
 
-        # Odometry: mean displacement vector from matched observed points to initial positions
+        # Odometry: mean displacement vector from matched observed points to initial positions,
+        # plus each point's birth_odom to account for historical odometry before it joined.
+        # total_odom[point] = (obs - init) + birth_odom
+        # NOTE: position update uses only (obs - init), i.e. the incremental displacement
+        # since the point joined; birth_odom is only added when computing the global odometry.
         odom_vecs: List[np.ndarray] = []
         for oi, mid in enumerate(matched_ids):
             if mid < 0:
                 continue
-            odom_vecs.append(obs_world[oi] - self._init_world[mid])
+            incremental = obs_world[oi] - self._init_world[mid]
+            birth = self._birth_odom[mid] if mid < len(self._birth_odom) else np.zeros(3, dtype=float)
+            odom_vecs.append(incremental + birth)
 
         if odom_vecs:
             mean_delta = np.mean(np.stack(odom_vecs, axis=0), axis=0)
             self._odometry = (float(mean_delta[0]), float(mean_delta[1]), float(mean_delta[2]))
-            # robot's movement is opposite to the points movement
-            self._odometry = (-self._odometry[0], -self._odometry[1], -self._odometry[2])
 
         # If no points matched in this frame, do NOT declare overall tracking lost
         # (points may re-appear within max_missed_frames)

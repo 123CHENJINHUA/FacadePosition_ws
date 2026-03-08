@@ -85,7 +85,7 @@ class SAM3_Process(Node):
         self._sync_slop_s: float = 0.05
 
         # MemoryBank for stable IDs
-        self.bank = MemoryBank(match_threshold=0.03, max_missed_frames=300)
+        self.bank = MemoryBank(match_threshold=0.05, max_missed_frames=300)
         self.bank_init = False
         self.total_3dpoints = []
         self.total_2dpoints = []
