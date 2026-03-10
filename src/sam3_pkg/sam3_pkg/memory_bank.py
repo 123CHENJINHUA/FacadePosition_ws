@@ -20,6 +20,19 @@ Notes:
 - Clockwise ordering is defined in XY plane of the *world* coordinates at init.
 - Pose uses roll-pitch-yaw (r,p,y) in radians, ZYX convention (yaw->pitch->roll).
 
+贪心匹配 (NN + threshold)
+        ↓
+几何一致性检验 (geometry_check_ratio > 0 且匹配点 >= 2)
+  ├── 计算所有匹配对的 pairwise 距离误差
+  │     rel_err = |obs_dist - ref_dist| / ref_dist
+  │     violated = rel_err > geometry_check_ratio
+  ├── 统计每个匹配点的违规次数
+  ├── 按"违规次数多→位置误差大"排序，逐一拒绝仍然违规的匹配
+  │     拒绝时：matched_ids[oi] = -1，回滚 new_positions 到原值
+  └── 更新 used_obs 和 matched_id_set
+        ↓
+后续 miss counter / 新点加入 / odometry 计算（基于验证后的匹配）
+
 """
 
 from __future__ import annotations
@@ -127,9 +140,14 @@ class UpdateResult:
 class MemoryBank:
     """Tracks a set of 3D points in world coordinates."""
 
-    def __init__(self, match_threshold: float = 0.05, max_missed_frames: int = 0):
+    def __init__(self, match_threshold: float = 0.05, max_missed_frames: int = 0,
+                 geometry_check_ratio: float = 0.15):
         self.match_threshold = float(match_threshold)
         self.max_missed_frames = int(max_missed_frames)
+        # Geometry consistency check: maximum allowed relative change in inter-point
+        # distance compared to the initial reference distances.
+        # e.g. 0.15 means allow ±15% change in pairwise distance.
+        self.geometry_check_ratio = float(geometry_check_ratio)
 
         # Camera model (set on initialize)
         self._fx: Optional[float] = None
@@ -294,6 +312,7 @@ class MemoryBank:
 
             used_obs = set()
             used_alive = set()
+            used_alive_map: dict[int, int] = {}  # oi -> aj index into alive_ids
 
             # Collect updates and commit once at the end
             new_positions = self._cur_world.copy()
@@ -313,6 +332,8 @@ class MemoryBank:
                     used_alive.add(aj)
 
                     matched_ids[oi] = real_id
+                    # Also record oi -> aj mapping for geometry check rollback
+                    used_alive_map[oi] = aj
 
                     # Update current track position with the newly observed world point
                     new_positions[real_id] = obs_world[oi]
@@ -320,6 +341,62 @@ class MemoryBank:
                 #     print(
                 #         f"Point {oi} unmatched (closest dist {dist:.4f} > threshold {self.match_threshold:.4f})"
                 #     )
+
+            # ---- Geometry consistency check ----
+            # The tracked points are physically stationary, so pairwise distances
+            # between matched points should remain close to their initial values.
+            # We verify all pairs; if a pair violates the constraint, we reject
+            # the worse match (most violations first, tie-break by distance error).
+            if self.geometry_check_ratio > 0:
+                cur_matches = [(oi, matched_ids[oi]) for oi in used_obs if matched_ids[oi] >= 0]
+                if len(cur_matches) >= 2:
+                    violation_count: dict[int, int] = {oi: 0 for oi, _ in cur_matches}
+                    for k in range(len(cur_matches)):
+                        oi_a, id_a = cur_matches[k]
+                        for l in range(k + 1, len(cur_matches)):
+                            oi_b, id_b = cur_matches[l]
+                            ref_dist = float(np.linalg.norm(
+                                self._init_world[id_a] - self._init_world[id_b]))
+                            obs_dist = float(np.linalg.norm(
+                                obs_world[oi_a] - obs_world[oi_b]))
+                            rel_err = abs(obs_dist - ref_dist) / max(ref_dist, 1e-6)
+                            if rel_err > self.geometry_check_ratio:
+                                violation_count[oi_a] += 1
+                                violation_count[oi_b] += 1
+
+                    # Sort violating matches: most violations first, tie-break by pos error
+                    violated_ois = [oi for oi, cnt in violation_count.items() if cnt > 0]
+                    violated_ois.sort(key=lambda oi: (
+                        -violation_count[oi],
+                        float(np.linalg.norm(obs_world[oi] - self._cur_world[matched_ids[oi]]))
+                    ))
+
+                    to_reject: set[int] = set()
+                    for oi in violated_ois:
+                        if matched_ids[oi] < 0:
+                            continue
+                        id_a = matched_ids[oi]
+                        still_violated = False
+                        for oi_b, id_b in cur_matches:
+                            if oi_b == oi or oi_b in to_reject or matched_ids[oi_b] < 0:
+                                continue
+                            ref_dist = float(np.linalg.norm(
+                                self._init_world[id_a] - self._init_world[id_b]))
+                            obs_dist = float(np.linalg.norm(
+                                obs_world[oi] - obs_world[oi_b]))
+                            rel_err = abs(obs_dist - ref_dist) / max(ref_dist, 1e-6)
+                            if rel_err > self.geometry_check_ratio:
+                                still_violated = True
+                                break
+                        if still_violated:
+                            to_reject.add(oi)
+                            # Roll back position update for the rejected track
+                            new_positions[id_a] = self._cur_world[id_a]
+                            matched_ids[oi] = -1
+
+                    if to_reject:
+                        used_obs -= to_reject
+                        matched_id_set = {matched_ids[oi] for oi in used_obs if matched_ids[oi] >= 0}
 
             # Visible points are the only ones eligible for missed-count increase.
             visible_mask = self._visible_mask_current(pose)
