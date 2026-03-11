@@ -20,19 +20,6 @@ Notes:
 - Clockwise ordering is defined in XY plane of the *world* coordinates at init.
 - Pose uses roll-pitch-yaw (r,p,y) in radians, ZYX convention (yaw->pitch->roll).
 
-贪心匹配 (NN + threshold)
-        ↓
-几何一致性检验 (geometry_check_ratio > 0 且匹配点 >= 2)
-  ├── 计算所有匹配对的 pairwise 距离误差
-  │     rel_err = |obs_dist - ref_dist| / ref_dist
-  │     violated = rel_err > geometry_check_ratio
-  ├── 统计每个匹配点的违规次数
-  ├── 按"违规次数多→位置误差大"排序，逐一拒绝仍然违规的匹配
-  │     拒绝时：matched_ids[oi] = -1，回滚 new_positions 到原值
-  └── 更新 used_obs 和 matched_id_set
-        ↓
-后续 miss counter / 新点加入 / odometry 计算（基于验证后的匹配）
-
 """
 
 from __future__ import annotations
@@ -129,6 +116,43 @@ def _pairwise_dist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.linalg.norm(diff, axis=2)
 
 
+def _estimate_rigid_transform(src: np.ndarray, dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate rigid body transform (R, t) from matched point pairs using SVD.
+
+    Solves: dst ≈ R @ src + t  (least squares, closed-form via SVD)
+
+    Args:
+        src: (N, 3) source points (previous positions of matched points).
+        dst: (N, 3) destination points (newly observed positions).
+
+    Returns:
+        R: (3, 3) rotation matrix.
+        t: (3,) translation vector.
+    """
+    assert src.shape == dst.shape and src.shape[0] >= 1
+
+    # Centroids
+    c_src = src.mean(axis=0)
+    c_dst = dst.mean(axis=0)
+
+    # Center the point clouds
+    A = src - c_src  # (N, 3)
+    B = dst - c_dst  # (N, 3)
+
+    # SVD of cross-covariance matrix
+    H = A.T @ B  # (3, 3)
+    U, S, Vt = np.linalg.svd(H)
+
+    # Ensure proper rotation (det == +1, not reflection)
+    d = np.linalg.det(Vt.T @ U.T)
+    D = np.diag([1.0, 1.0, d])
+
+    R = Vt.T @ D @ U.T  # (3, 3)
+    t = c_dst - R @ c_src  # (3,)
+
+    return R, t
+
+
 @dataclass
 class UpdateResult:
     matched_ids: Optional[List[int]]
@@ -140,14 +164,9 @@ class UpdateResult:
 class MemoryBank:
     """Tracks a set of 3D points in world coordinates."""
 
-    def __init__(self, match_threshold: float = 0.05, max_missed_frames: int = 0,
-                 geometry_check_ratio: float = 0.15):
+    def __init__(self, match_threshold: float = 0.05, max_missed_frames: int = 0):
         self.match_threshold = float(match_threshold)
         self.max_missed_frames = int(max_missed_frames)
-        # Geometry consistency check: maximum allowed relative change in inter-point
-        # distance compared to the initial reference distances.
-        # e.g. 0.15 means allow ±15% change in pairwise distance.
-        self.geometry_check_ratio = float(geometry_check_ratio)
 
         # Camera model (set on initialize)
         self._fx: Optional[float] = None
@@ -312,7 +331,6 @@ class MemoryBank:
 
             used_obs = set()
             used_alive = set()
-            used_alive_map: dict[int, int] = {}  # oi -> aj index into alive_ids
 
             # Collect updates and commit once at the end
             new_positions = self._cur_world.copy()
@@ -332,8 +350,6 @@ class MemoryBank:
                     used_alive.add(aj)
 
                     matched_ids[oi] = real_id
-                    # Also record oi -> aj mapping for geometry check rollback
-                    used_alive_map[oi] = aj
 
                     # Update current track position with the newly observed world point
                     new_positions[real_id] = obs_world[oi]
@@ -341,62 +357,6 @@ class MemoryBank:
                 #     print(
                 #         f"Point {oi} unmatched (closest dist {dist:.4f} > threshold {self.match_threshold:.4f})"
                 #     )
-
-            # ---- Geometry consistency check ----
-            # The tracked points are physically stationary, so pairwise distances
-            # between matched points should remain close to their initial values.
-            # We verify all pairs; if a pair violates the constraint, we reject
-            # the worse match (most violations first, tie-break by distance error).
-            if self.geometry_check_ratio > 0:
-                cur_matches = [(oi, matched_ids[oi]) for oi in used_obs if matched_ids[oi] >= 0]
-                if len(cur_matches) >= 2:
-                    violation_count: dict[int, int] = {oi: 0 for oi, _ in cur_matches}
-                    for k in range(len(cur_matches)):
-                        oi_a, id_a = cur_matches[k]
-                        for l in range(k + 1, len(cur_matches)):
-                            oi_b, id_b = cur_matches[l]
-                            ref_dist = float(np.linalg.norm(
-                                self._init_world[id_a] - self._init_world[id_b]))
-                            obs_dist = float(np.linalg.norm(
-                                obs_world[oi_a] - obs_world[oi_b]))
-                            rel_err = abs(obs_dist - ref_dist) / max(ref_dist, 1e-6)
-                            if rel_err > self.geometry_check_ratio:
-                                violation_count[oi_a] += 1
-                                violation_count[oi_b] += 1
-
-                    # Sort violating matches: most violations first, tie-break by pos error
-                    violated_ois = [oi for oi, cnt in violation_count.items() if cnt > 0]
-                    violated_ois.sort(key=lambda oi: (
-                        -violation_count[oi],
-                        float(np.linalg.norm(obs_world[oi] - self._cur_world[matched_ids[oi]]))
-                    ))
-
-                    to_reject: set[int] = set()
-                    for oi in violated_ois:
-                        if matched_ids[oi] < 0:
-                            continue
-                        id_a = matched_ids[oi]
-                        still_violated = False
-                        for oi_b, id_b in cur_matches:
-                            if oi_b == oi or oi_b in to_reject or matched_ids[oi_b] < 0:
-                                continue
-                            ref_dist = float(np.linalg.norm(
-                                self._init_world[id_a] - self._init_world[id_b]))
-                            obs_dist = float(np.linalg.norm(
-                                obs_world[oi] - obs_world[oi_b]))
-                            rel_err = abs(obs_dist - ref_dist) / max(ref_dist, 1e-6)
-                            if rel_err > self.geometry_check_ratio:
-                                still_violated = True
-                                break
-                        if still_violated:
-                            to_reject.add(oi)
-                            # Roll back position update for the rejected track
-                            new_positions[id_a] = self._cur_world[id_a]
-                            matched_ids[oi] = -1
-
-                    if to_reject:
-                        used_obs -= to_reject
-                        matched_id_set = {matched_ids[oi] for oi in used_obs if matched_ids[oi] >= 0}
 
             # Visible points are the only ones eligible for missed-count increase.
             visible_mask = self._visible_mask_current(pose)
@@ -450,31 +410,38 @@ class MemoryBank:
                     matched_ids[oi] = new_id
                     matched_id_set.add(new_id)
 
-            # Apply mean offset of matched points to unmatched alive points.
-            # mean_delta here is the mean incremental displacement this frame
-            # (obs_world - cur_world for matched pairs), which represents the
-            # rigid-body motion of the scene in this frame.
-            # Since all points share the same physical motion, we apply this
-            # incremental delta uniformly to unmatched points regardless of
-            # their individual birth_odom (birth_odom is only relevant for
-            # computing global odometry, not for position updates).
+            # Use matched point pairs to estimate a rigid body transform (R, t)
+            # via SVD, then apply it to predict positions of unmatched alive points.
+            # With only 1 matched pair, falls back to pure translation (no rotation).
             if used_obs:
-                deltas = []
+                src_pts = []  # previous positions of matched points
+                dst_pts = []  # newly observed positions of matched points
                 for oi in used_obs:
                     mid = matched_ids[oi]
                     if mid >= 0:
-                        # incremental displacement this frame: obs - previous cur
-                        deltas.append(obs_world[oi] - self._cur_world[mid])
+                        src_pts.append(self._cur_world[mid])   # position before this frame
+                        dst_pts.append(obs_world[oi])          # position this frame
 
-                if deltas:
-                    mean_incremental = np.mean(np.stack(deltas, axis=0), axis=0)
-                    matched_id_set = {matched_ids[oi] for oi in used_obs if matched_ids[oi] >= 0}
+                if src_pts:
+                    src_arr = np.stack(src_pts, axis=0)  # (K, 3)
+                    dst_arr = np.stack(dst_pts, axis=0)  # (K, 3)
+
+                    if src_arr.shape[0] >= 3:
+                        # Enough points: estimate full rigid transform (R + t)
+                        R_est, t_est = _estimate_rigid_transform(src_arr, dst_arr)
+                    else:
+                        # Too few points for reliable rotation: pure translation
+                        R_est = np.eye(3, dtype=float)
+                        t_est = (dst_arr - src_arr).mean(axis=0)
+
+                    matched_id_set_obs = {matched_ids[oi] for oi in used_obs if matched_ids[oi] >= 0}
                     for idx in alive_ids:
                         idx_i = int(idx)
-                        if idx_i in matched_id_set:
+                        if idx_i in matched_id_set_obs:
                             continue
-                        # Apply the same incremental motion to unmatched alive points
-                        new_positions[idx_i] = new_positions[idx_i] + mean_incremental
+                        # Apply rigid transform to predict new position
+                        p = new_positions[idx_i]
+                        new_positions[idx_i] = R_est @ p + t_est
 
             # Commit the new current positions (do not touch init positions)
             self._cur_world = new_positions
