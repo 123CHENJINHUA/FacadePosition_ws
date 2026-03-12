@@ -92,6 +92,7 @@ class SAM3_Process(Node):
         self.odometry = None
         self.offset2edge = 0
         self.mask_area_ratio_threshold = 0.2  # drop masks with area < this ratio * median area
+        self.edge_margin = 20 # pixels from edge to consider as "touching border"
 
         # NEW: request to reinitialize MemoryBank init points on next frame
         self.reinit_bank_pending: bool = False
@@ -448,6 +449,24 @@ class SAM3_Process(Node):
                     if median_area > 0:
                         keep = areas >= self.mask_area_ratio_threshold * median_area
                         masks = masks[keep]
+                # filter out masks whose bounding box touches the image border
+                
+                if masks.shape[0] > 0:
+                    mh, mw = masks.shape[2], masks.shape[3]
+                    keep_edge = []
+                    for i in range(masks.shape[0]):
+                        m = masks[i, 0]
+                        ys, xs = np.where(m > 0)
+                        if len(xs) == 0:
+                            keep_edge.append(False)
+                            continue
+                        x_min, x_max = int(xs.min()), int(xs.max())
+                        y_min, y_max = int(ys.min()), int(ys.max())
+                        if x_min < self.edge_margin or y_min < self.edge_margin or x_max >= mw - self.edge_margin or y_max >= mh - self.edge_margin:
+                            keep_edge.append(False)
+                        else:
+                            keep_edge.append(True)
+                    masks = masks[np.array(keep_edge, dtype=bool)]
         except Exception as e:
             self.get_logger().warn(f'SAM3 inference error: {e}')
             masks = None
