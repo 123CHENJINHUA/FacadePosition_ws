@@ -91,6 +91,7 @@ class SAM3_Process(Node):
         self.total_2dpoints = []
         self.odometry = None
         self.offset2edge = 0
+        self.mask_area_ratio_threshold = 0.2  # drop masks with area < this ratio * median area
 
         # NEW: request to reinitialize MemoryBank init points on next frame
         self.reinit_bank_pending: bool = False
@@ -440,6 +441,13 @@ class SAM3_Process(Node):
             if masks is not None:
                 masks = masks.cpu().numpy()  # [N,1,H,W]
                 masks = apply_nms_to_masks(masks, iou_threshold=0.3)
+                # filter out outlier-small masks based on area distribution
+                if masks.shape[0] > 0:
+                    areas = np.array([int(np.count_nonzero(masks[i, 0])) for i in range(masks.shape[0])], dtype=np.float32)
+                    median_area = float(np.median(areas))
+                    if median_area > 0:
+                        keep = areas >= self.mask_area_ratio_threshold * median_area
+                        masks = masks[keep]
         except Exception as e:
             self.get_logger().warn(f'SAM3 inference error: {e}')
             masks = None
@@ -463,13 +471,6 @@ class SAM3_Process(Node):
             if masks is not None and masks.shape[0] > 0 and depth_m is not None and self.cam_K is not None:
                 for i in range(masks.shape[0]):
                     mask = (masks[i, 0].astype(np.uint8) * 255)
-
-                    # # log mask size (pixel area)
-                    # try:
-                    #     area_px = int(np.count_nonzero(mask))
-                    #     self.get_logger().info(f'[SAM3] type=0 mask[{i}] area_px={area_px}')
-                    # except Exception:
-                    #     pass
 
                     # visualize mask (red)
                     color = (0, 0, 255)
@@ -618,14 +619,8 @@ class SAM3_Process(Node):
                 for i in range(masks.shape[0]):
                     mask = masks[i, 0]  # [resolution, resolution]
 
-                    # log mask size (pixel area)
-                    # try:
-                    #     area_px = int(np.count_nonzero(mask))
-                    #     self.get_logger().info(f'[SAM3] type=2 mask[{i}] area_px={area_px}')
-                    # except Exception:
-                    #     pass
-
                     mask = mask.astype(np.uint8) * 255
+
                     color = (255, 0, 0)
 
                     colored_mask = np.zeros_like(display_frame, dtype=np.uint8)
@@ -692,10 +687,10 @@ class SAM3_Process(Node):
         # )
         cv2.putText(display_frame, f'Description: {self.last_description}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        # # debug
-        # # draw all init/current world points (when bank has been initialized)
-        # _draw_bank_world_points(display_frame, start_x, start_y, res, init_w = self.bank.init_world_points,
-        # cur_w = self.bank.current_world_points,last_pose_cam2world = self.last_pose_cam2world,cam_K=self.cam_K)
+        # debug
+        # draw all init/current world points (when bank has been initialized)
+        _draw_bank_world_points(display_frame, start_x, start_y, res, init_w = self.bank.init_world_points,
+        cur_w = self.bank.current_world_points,last_pose_cam2world = self.last_pose_cam2world,cam_K=self.cam_K)
 
         self._enqueue_publish(display_frame, self.last_color_msg)
 
